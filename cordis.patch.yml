@@ -1,0 +1,7 @@
+# dsh-temp-cwd bundle patch: adds the temp-session row to the profile roster.
+# The node half (exports ".") runs in the host process (mkdir route), and the
+# dsh.client declaration in package.json makes the browser half
+# (exports "./client") load in the web GUI.
+- insert:
+    - id: temp-cwd
+      name: 'dsh-temp-cwd'
