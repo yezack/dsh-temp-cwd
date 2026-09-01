@@ -65,11 +65,11 @@ function apply(ctx) {
     }
   });
   ctx.slots.inject(
-    "conversation.hero.agentPreset",
+    "conversation.hero.workspace",
     () => ctx.slots.register(
       {
-        name: "conversation.hero.agentPreset",
-        priority: 1,
+        name: "conversation.hero.workspace",
+        priority: -1,
         inject: () => ({
           /** Official session controller: create({ workspaceId }) / open(id). */
           sessions,
