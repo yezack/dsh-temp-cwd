@@ -1,14 +1,28 @@
 /**
- * dsh-temp-cwd — browser half (v6).
+ * dsh-temp-cwd — browser half (v7).
  *
- * v6 removes ALL UI intervention from v4/v5:
- *   - no React fiber walking, no MutationObserver, no DOM guards,
- *     no placeholder hiding, no host-chip hiding, no custom popover,
- *     no custom chips — nothing touches the host's DOM or editors.
- * The ONLY UI this plugin adds is a single 「新建临时对话」 button in the
- * sidebar footer (the `sidebar.footer.action` list slot).
+ * v6 put the single 「新建临时对话」 button in the sidebar footer
+ * (`sidebar.footer.action`). The user wants it next to the host's
+ * 「选择工作区」 chip in the hero row instead (主界面顶部 chip 的后面).
  *
- * Click flow (all official APIs):
+ * v7 moves it there via the `conversation.hero.agentPreset` single slot,
+ * which renders right after the chip in `heroWorkspaceRow`:
+ *
+ *   heroWorkspaceRow
+ *     ├── WorkspaceChip            («选择工作区» chip, host-owned)
+ *     ├── conversation.hero.workspace  (workspace picker menu; renders
+ *     │                                nothing when closed)
+ *     └── conversation.hero.agentPreset ← our button lives here
+ *
+ * That slot is registered by the official agent-preset plugin, which is NOT
+ * enabled in this profile (code profile bundles: no agent-preset), so the
+ * seat is free. We register with `priority: 1` while agent-preset uses the
+ * default `priority: 0` — the slots kernel renders the LOWEST priority entry
+ * ("register at a different priority to shadow it (lowest renders)"), so if
+ * the user ever enables agent-preset later, the official seat wins and our
+ * button simply disappears. Zero conflict, zero shadowing of official UI.
+ *
+ * Click flow (all official APIs, unchanged from v6):
  *   1. POST /api/temp-cwd/mkdir        → host creates a temp directory
  *   2. workspaces.create({ path })     → adopt it as a REAL workspace
  *   3. sessions.create({ workspaceId })→ session attached to that workspace
@@ -82,12 +96,16 @@ export function apply(ctx: any): void {
     }
   })
 
-  // The one and only UI this plugin adds: a sidebar footer action.
-  ctx.slots.inject('sidebar.footer.action', () =>
+  // The one and only UI this plugin adds: a 「新建临时对话」 button sitting
+  // right after the host's 「选择工作区」 chip in the hero row.
+  // The agentPreset seat is free in this profile (agent-preset not enabled);
+  // priority 1 vs the official default 0 means the official seat wins if it
+  // ever gets enabled — lowest priority renders.
+  ctx.slots.inject('conversation.hero.agentPreset', () =>
     ctx.slots.register(
       {
-        name: 'sidebar.footer.action',
-        id: 'temp-cwd',
+        name: 'conversation.hero.agentPreset',
+        priority: 1,
         inject: () => ({
           /** Official session controller: create({ workspaceId }) / open(id). */
           sessions,
@@ -162,8 +180,8 @@ function armCleanup(sessions: any, workspaces: any, workspaceId: string, session
 }
 
 /**
- * Sidebar footer action — the single button this plugin adds. Plain host-
- * token styling, no other UI.
+ * Hero-row action — the single button this plugin adds, styled as a chip so
+ * it sits naturally next to the host's 「选择工作区」 chip (host tokens only).
  */
 function TempSessionButton(props: any) {
   const { sessions, workspaces } = props
@@ -198,13 +216,13 @@ function TempSessionButton(props: any) {
         onMouseLeave: () => setHovered(false),
         title: '创建临时工作区并直接开始对话（发出第一条消息后自动进入未分组）',
         style: {
-          ...actionButtonStyle,
+          ...chipButtonStyle,
           background: hovered ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
           opacity: busy ? 0.65 : 1,
           cursor: busy ? 'wait' : 'pointer',
         },
       },
-      plusIcon(),
+      folderPlusIcon(),
       busy ? '创建中…' : '新建临时对话',
     ),
     error
@@ -215,8 +233,8 @@ function TempSessionButton(props: any) {
 
 /* ---- helpers ---- */
 
-/** Minimal lucide-style plus glyph. */
-function plusIcon() {
+/** Minimal lucide-style folder-plus glyph. */
+function folderPlusIcon() {
   return React.createElement(
     'svg',
     {
@@ -230,36 +248,36 @@ function plusIcon() {
       strokeLinejoin: 'round',
       style: { flexShrink: 0 },
     },
-    React.createElement('path', { d: 'M5 12h14' }),
-    React.createElement('path', { d: 'M12 5v14' }),
+    React.createElement('path', {
+      d: 'M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z',
+    }),
+    React.createElement('line', { x1: '12', y1: '11', x2: '12', y2: '17' }),
+    React.createElement('line', { x1: '9', y1: '14', x2: '15', y2: '14' }),
   )
 }
 
 /* ---- inline styles (host design tokens only) ---- */
 
-const actionButtonStyle = {
-  display: 'flex',
+/** Chip-like action button, harmonized with the host's workspace chip. */
+const chipButtonStyle = {
+  display: 'inline-flex',
   alignItems: 'center',
   gap: 6,
-  width: '100%',
-  boxSizing: 'border-box',
-  minWidth: 0,
-  padding: '6px 8px',
+  marginLeft: 8,
+  padding: '4px 10px',
   borderRadius: 8,
-  border: 'none',
+  border: '1px solid var(--dsw-alias-stroke-strong, rgba(128, 128, 128, 0.35))',
   color: 'var(--dsw-alias-label-secondary)',
   fontSize: 13,
   fontWeight: 500,
   lineHeight: '20px',
-  textAlign: 'left',
   whiteSpace: 'nowrap',
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
+  fontFamily: 'inherit',
 }
 
 const errorStyle = {
   color: 'var(--dsw-alias-danger, #f56c6c)',
   fontSize: 12,
   lineHeight: '16px',
-  padding: '2px 8px 4px',
+  padding: '2px 0 0 8px',
 }
