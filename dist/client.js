@@ -42,6 +42,7 @@ module.exports = __toCommonJS(client_exports);
 var React = __toESM(require("react"), 1);
 var name = "temp-cwd-client";
 var inject = ["slots", "sessions", "workspaces", "uiWorkspace"];
+var tempCwd = null;
 function apply(ctx) {
   const workspaces = ctx.workspaces;
   const sessions = ctx.sessions;
@@ -54,6 +55,17 @@ function apply(ctx) {
     }
     originalStartSession(workspaceId);
   };
+  const mo = new MutationObserver(() => {
+    if (tempCwd !== null) unlockComposer();
+  });
+  mo.observe(document.documentElement, {
+    subtree: true,
+    childList: true,
+    attributes: true,
+    attributeFilter: ["contenteditable", "class"]
+  });
+  if (tempCwd !== null) unlockComposer();
+  ctx.on("dispose", () => mo.disconnect());
   ctx.slots.inject(
     "conversation.hero.workspace",
     () => ctx.slots.register(
@@ -61,8 +73,10 @@ function apply(ctx) {
         name: "conversation.hero.workspace",
         priority: -1,
         inject: () => ({
-          /** Official session controller: create({ cwd }) / open(id). */
+          /** Official session controller: create({ workspaceId }) / open(id). */
           sessions,
+          /** Official workspace controller: create({ path }) / delete(id). */
+          workspaces,
           /** Workspace projection model: subscribe / getSnapshot / items / phase. */
           workspacesModel: workspaces.list
         })
@@ -71,15 +85,60 @@ function apply(ctx) {
     )
   );
 }
+function unlockComposer() {
+  if (tempCwd === null) return;
+  const el = document.querySelector("[data-composer-input]");
+  if (!el) return;
+  const hostOnKeyDown = () => {
+    const fiberKey2 = Object.keys(el).find((k) => k.startsWith("__reactFiber$"));
+    const hostFiber = fiberKey2 ? el[fiberKey2] : null;
+    return !!(hostFiber && hostFiber.memoizedProps && hostFiber.memoizedProps.onKeyDown);
+  };
+  let editor = null;
+  const fiberKey = Object.keys(el).find((k) => k.startsWith("__reactFiber$"));
+  let node = fiberKey ? el[fiberKey] : null;
+  while (node && !editor) {
+    const mp = node.memoizedProps;
+    if (mp && mp.keyboard && mp.keyboard.editor) editor = mp.keyboard.editor;
+    node = node.return;
+  }
+  if (!editor || !hostOnKeyDown()) return;
+  if (editor.getRootElement?.() !== el) editor.setRootElement(el);
+  try {
+    if (editor.isEditable?.() !== true) editor.setEditable(true);
+  } catch {
+  }
+  if (el.contentEditable !== "true") el.contentEditable = "true";
+  const ph = el.parentElement?.querySelector("[data-composer-placeholder]");
+  if (ph && ph.style.display !== "none") ph.style.display = "none";
+  if (!el.__tempCwdClickGuarded) {
+    ;
+    el.__tempCwdClickGuarded = true;
+    el.addEventListener(
+      "click",
+      (e) => {
+        if (hostOnKeyDown()) e.stopPropagation();
+      },
+      true
+    );
+  }
+  if (!el.__tempCwdKeyGuarded) {
+    ;
+    el.__tempCwdKeyGuarded = true;
+    el.addEventListener("keydown", (e) => {
+      if (hostOnKeyDown()) e.stopPropagation();
+    });
+  }
+}
 function TempWorkspaceRow(props) {
-  const { open, anchorRef, onPick, onClose, workspacesModel, selectedId, sessions } = props;
+  const { open, anchorRef, onPick, onClose, workspacesModel, selectedId, sessions, workspaces } = props;
   const [busy, setBusy] = React.useState(false);
   const [hovered, setHovered] = React.useState(false);
   const [error, setError] = React.useState(null);
   const [rect, setRect] = React.useState(null);
   const panelRef = React.useRef(null);
   const btnRef = React.useRef(null);
-  const tempCwdRef = React.useRef(null);
+  const [tempCwdState, setTempCwdState] = React.useState(() => tempCwd);
   const selectedIdRef = React.useRef(selectedId);
   selectedIdRef.current = selectedId;
   const isEmpty = selectedId === void 0;
@@ -95,7 +154,7 @@ function TempWorkspaceRow(props) {
     (cb) => workspacesModel.subscribe(cb),
     () => workspacesModel.getSnapshot()
   );
-  const workspaces = snapshot?.items ?? [];
+  const workspacesList = snapshot?.items ?? [];
   React.useEffect(() => {
     if (!open) return;
     const host = anchorRef?.current;
@@ -122,64 +181,6 @@ function TempWorkspaceRow(props) {
       document.removeEventListener("keydown", onKey);
     };
   }, [open, onClose, anchorRef]);
-  const unlockComposer = () => {
-    if (tempCwdRef.current === null) return;
-    const el = document.querySelector("[data-composer-input]");
-    if (!el) return;
-    const hostOnKeyDown = () => {
-      const fiberKey2 = Object.keys(el).find((k) => k.startsWith("__reactFiber$"));
-      const hostFiber = fiberKey2 ? el[fiberKey2] : null;
-      return !!(hostFiber && hostFiber.memoizedProps && hostFiber.memoizedProps.onKeyDown);
-    };
-    let editor = null;
-    const fiberKey = Object.keys(el).find((k) => k.startsWith("__reactFiber$"));
-    let node = fiberKey ? el[fiberKey] : null;
-    while (node && !editor) {
-      const mp = node.memoizedProps;
-      if (mp && mp.keyboard && mp.keyboard.editor) editor = mp.keyboard.editor;
-      node = node.return;
-    }
-    if (!editor || !hostOnKeyDown()) return;
-    if (editor.getRootElement?.() !== el) editor.setRootElement(el);
-    try {
-      if (editor.isEditable?.() !== true) editor.setEditable(true);
-    } catch {
-    }
-    if (el.contentEditable !== "true") el.contentEditable = "true";
-    const ph = el.parentElement?.querySelector("[data-composer-placeholder]");
-    if (ph && ph.style.display !== "none") ph.style.display = "none";
-    if (!el.__tempCwdClickGuarded) {
-      ;
-      el.__tempCwdClickGuarded = true;
-      el.addEventListener(
-        "click",
-        (e) => {
-          if (hostOnKeyDown()) e.stopPropagation();
-        },
-        true
-      );
-    }
-    if (!el.__tempCwdKeyGuarded) {
-      ;
-      el.__tempCwdKeyGuarded = true;
-      el.addEventListener("keydown", (e) => {
-        if (hostOnKeyDown()) e.stopPropagation();
-      });
-    }
-  };
-  React.useEffect(() => {
-    const mo = new MutationObserver(() => {
-      if (tempCwdRef.current !== null) unlockComposer();
-    });
-    mo.observe(document.body, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      attributeFilter: ["contenteditable", "class"]
-    });
-    unlockComposer();
-    return () => mo.disconnect();
-  }, []);
   const handleTemp = async () => {
     if (busy) return;
     setBusy(true);
@@ -188,9 +189,12 @@ function TempWorkspaceRow(props) {
       const res = await fetch("/api/temp-cwd/mkdir", { method: "POST" });
       if (!res.ok) throw new Error(`mkdir failed: ${res.status}`);
       const { path } = await res.json();
-      const sessionId = await sessions.create({ cwd: path });
-      tempCwdRef.current = path;
+      const workspace = await workspaces.create({ path });
+      const sessionId = await sessions.create({ workspaceId: workspace.workspaceId });
+      tempCwd = path;
+      setTempCwdState(path);
       await sessions.open(sessionId);
+      await workspaces.delete(workspace.workspaceId);
       onClose?.();
       unlockComposer();
     } catch (err) {
@@ -200,7 +204,7 @@ function TempWorkspaceRow(props) {
       setBusy(false);
     }
   };
-  const showTempChip = tempCwdRef.current !== null && selectedId === void 0 && !busy;
+  const showTempChip = tempCwdState !== null && selectedId === void 0 && !busy;
   return React.createElement(
     React.Fragment,
     null,
@@ -225,12 +229,12 @@ function TempWorkspaceRow(props) {
     ),
     showTempChip ? React.createElement(
       "div",
-      { style: selectedChipStyle, title: tempCwdRef.current ?? void 0 },
+      { style: selectedChipStyle, title: tempCwdState ?? void 0 },
       folderIcon(),
       React.createElement(
         "span",
         { style: { overflow: "hidden", textOverflow: "ellipsis" } },
-        dirLabel(tempCwdRef.current ?? "")
+        dirLabel(tempCwdState ?? "")
       )
     ) : null,
     error ? React.createElement("div", { role: "alert", style: errorStyle }, error) : null,
@@ -238,7 +242,7 @@ function TempWorkspaceRow(props) {
       "div",
       { ref: panelRef, style: { ...panelStyle, top: rect.top, left: rect.left } },
       React.createElement("div", { style: panelTitleStyle }, "\u5DE5\u4F5C\u533A"),
-      workspaces.length === 0 ? React.createElement("div", { style: emptyStyle }, "\u6682\u65E0\u5DE5\u4F5C\u533A") : workspaces.map(
+      workspacesList.length === 0 ? React.createElement("div", { style: emptyStyle }, "\u6682\u65E0\u5DE5\u4F5C\u533A") : workspacesList.map(
         (workspace) => React.createElement(
           "button",
           {

@@ -16,9 +16,11 @@ const checks = [
   ['inject sessions', () => code.includes('sessions')],
   ['apply exported', () => /function apply\(ctx\)/.test(code) && code.includes('apply: () => apply')],
   ['slots.inject usage', () => code.includes('slots.inject')],
-  ['sessions.create cwd', () => code.includes('sessions.create') && code.includes('cwd')],
+  ['workspaces.create + delete (v5)', () => code.includes('workspaces.create({ path })') && code.includes('workspaces.delete(workspace.workspaceId)')],
+  ['sessions.create workspaceId (v5)', () => code.includes('sessions.create({ workspaceId: workspace.workspaceId })')],
   ['startSession wrapper', () => code.includes('startSession = (workspaceId) => {') && code.includes('sessions.clear()')],
   ['fiber editor unlock', () => code.includes('__reactFiber$') && code.includes('setRootElement') && code.includes('setEditable')],
+  ['global observer (v5)', () => code.includes('new MutationObserver') && code.includes("mo.observe(document.documentElement")],
 ]
 
 let failed = false
