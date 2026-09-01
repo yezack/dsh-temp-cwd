@@ -16,11 +16,12 @@ const checks = [
   ['inject sessions', () => code.includes('sessions')],
   ['apply exported', () => /function apply\(ctx\)/.test(code) && code.includes('apply: () => apply')],
   ['slots.inject usage', () => code.includes('slots.inject')],
-  ['workspaces.create + delete (v5)', () => code.includes('workspaces.create({ path })') && code.includes('workspaces.delete(workspace.workspaceId)')],
-  ['sessions.create workspaceId (v5)', () => code.includes('sessions.create({ workspaceId: workspace.workspaceId })')],
+  ['sidebar footer slot (v6)', () => code.includes('sidebar.footer.action') && code.includes('id: "temp-cwd"')],
+  ['workspaces.create + delete', () => code.includes('workspaces.create({ path })') && code.includes('workspaces.delete(workspace.workspaceId)')],
+  ['sessions.create workspaceId', () => code.includes('sessions.create({ workspaceId: workspace.workspaceId })')],
+  ['blank-first-message cleanup (v6)', () => code.includes('sessions.list.subscribe') && code.includes('entry.blank === false') && code.includes('snap.current !== sessionId')],
   ['startSession wrapper', () => code.includes('startSession = (workspaceId) => {') && code.includes('sessions.clear()')],
-  ['fiber editor unlock', () => code.includes('__reactFiber$') && code.includes('setRootElement') && code.includes('setEditable')],
-  ['global observer (v5)', () => code.includes('new MutationObserver') && code.includes("mo.observe(document.documentElement")],
+  ['no UI intervention leftovers (v6)', () => !code.includes('__reactFiber$') && !code.includes('MutationObserver') && !code.includes('setRootElement') && !code.includes('conversation.hero.workspace')],
 ]
 
 let failed = false
