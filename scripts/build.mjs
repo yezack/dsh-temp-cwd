@@ -35,7 +35,7 @@ await build({
 
 const core = readFileSync('dist/client-core.js', 'utf8')
 const wrapped = `window.__ModuleLoader__.load({
-\tid: "dsh-temp-cwd",
+\tid: "@yezack/dsh-temp-cwd",
 \tfactory: (require) => {
 \t\tvar module = { exports: {} };
 \t\tvar exports = module.exports;

@@ -1,5 +1,5 @@
 {
-  "name": "dsh-temp-cwd",
+  "name": "@yezack/dsh-temp-cwd",
   "version": "0.1.0",
   "description": "One-click temp session for dsh: create <root>/<timestamp> (default ~/Documents/dsh-workspaces) and open a workspace-less session with cwd there.",
   "type": "module",
@@ -19,6 +19,7 @@
     "client": {
       "inject": [
         "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-api-workspace-controller",
         "@deepseek-ai/dsh-client-ui-renderer",
         "@deepseek-ai/dsh-client-ui-sidebar"
       ],

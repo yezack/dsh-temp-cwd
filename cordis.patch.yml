@@ -4,4 +4,4 @@
 # (exports "./client") load in the web GUI.
 - insert:
     - id: temp-cwd
-      name: 'dsh-temp-cwd'
+      name: '@yezack/dsh-temp-cwd'

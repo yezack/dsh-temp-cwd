@@ -1,9 +1,9 @@
-# dsh-temp-cwd
+# @yezack/dsh-temp-cwd
 
-One-click temp session for dsh. Adds a 「临时会话」 button to the sidebar
-footer: it creates a timestamped directory under a configurable root (default
-`~/Documents/dsh-workspaces/<YYYYMMDDHHmmss>`) and opens a **workspace-less
-session** whose cwd points at that directory.
+One-click temp session for dsh. Adds a 「临时会话」 button to the new-session
+hero (workspace picker area): it creates a timestamped directory under a
+configurable root (default `~/Documents/dsh-workspaces/<YYYYMMDDHHmmss>`)
+and opens a **workspace-less session** whose cwd points at that directory.
 
 Uses only public dsh APIs — the native `session/create` accepts `cwd`
 without `workspaceId`, so no UI takeover or monkey-patching is involved.
@@ -14,7 +14,7 @@ without `workspaceId`, so no UI takeover or monkey-patching is involved.
 dsh plugin --profile desktop add github:yezack/dsh-temp-cwd
 ```
 
-Restart the dsh desktop app, then click 「临时会话」 in the sidebar footer.
+Restart the dsh desktop app, then click 「临时会话」 in the new-session hero.
 
 ## Config
 
