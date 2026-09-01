@@ -16,12 +16,12 @@ const checks = [
   ['inject sessions', () => code.includes('sessions')],
   ['apply exported', () => /function apply\(ctx\)/.test(code) && code.includes('apply: () => apply')],
   ['slots.inject usage', () => code.includes('slots.inject')],
-  ['hero agentPreset slot (v7)', () => code.includes('conversation.hero.agentPreset') && code.includes('priority: 1')],
+  ['hero workspace slot (v8)', () => code.includes('conversation.hero.workspace') && code.includes('priority: -1') && !code.includes('conversation.hero.agentPreset')],
   ['workspaces.create + delete', () => code.includes('workspaces.create({ path })') && code.includes('workspaces.delete(workspace.workspaceId)')],
   ['sessions.create workspaceId', () => code.includes('sessions.create({ workspaceId: workspace.workspaceId })')],
   ['blank-first-message cleanup (v6)', () => code.includes('sessions.list.subscribe') && code.includes('entry.blank === false') && code.includes('snap.current !== sessionId')],
   ['startSession wrapper', () => code.includes('startSession = (workspaceId) => {') && code.includes('sessions.clear()')],
-  ['no UI intervention leftovers (v7)', () => !code.includes('__reactFiber$') && !code.includes('MutationObserver') && !code.includes('setRootElement') && !code.includes('inject("conversation.hero.workspace"') && !code.includes('inject("sidebar.footer.action"')],
+  ['no UI intervention leftovers (v8)', () => !code.includes('__reactFiber$') && !code.includes('MutationObserver') && !code.includes('setRootElement') && !code.includes('inject("sidebar.footer.action"') && !code.includes("inject('sidebar.footer.action'")],
 ]
 
 let failed = false

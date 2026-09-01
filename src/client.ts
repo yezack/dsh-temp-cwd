@@ -1,26 +1,34 @@
 /**
- * dsh-temp-cwd — browser half (v7).
+ * dsh-temp-cwd — browser half (v8).
  *
  * v6 put the single 「新建临时对话」 button in the sidebar footer
  * (`sidebar.footer.action`). The user wants it next to the host's
  * 「选择工作区」 chip in the hero row instead (主界面顶部 chip 的后面).
  *
- * v7 moves it there via the `conversation.hero.agentPreset` single slot,
- * which renders right after the chip in `heroWorkspaceRow`:
+ * v7 tried `conversation.hero.agentPreset` — FAILED in the real desktop:
+ * that seat is registered by the official agent-preset plugin (default
+ * `priority: 0`, the 「模式选择」 chip the user actually sees), while we
+ * registered at `priority: 1`. The slots kernel renders the LOWEST priority
+ * entry of a single seat ("register at a different priority to shadow it
+ * (lowest renders)") — the official seat won and our button silently
+ * disappeared behind 「模式选择」.
  *
- *   heroWorkspaceRow
- *     ├── WorkspaceChip            («选择工作区» chip, host-owned)
- *     ├── conversation.hero.workspace  (workspace picker menu; renders
- *     │                                nothing when closed)
- *     └── conversation.hero.agentPreset ← our button lives here
+ * v8 moves to `conversation.hero.workspace` instead. The hero row is:
  *
- * That slot is registered by the official agent-preset plugin, which is NOT
- * enabled in this profile (code profile bundles: no agent-preset), so the
- * seat is free. We register with `priority: 1` while agent-preset uses the
- * default `priority: 0` — the slots kernel renders the LOWEST priority entry
- * ("register at a different priority to shadow it (lowest renders)"), so if
- * the user ever enables agent-preset later, the official seat wins and our
- * button simply disappears. Zero conflict, zero shadowing of official UI.
+ *   heroWorkspaceRow (rendered whenever the hero is up, both slots
+ *   unconditionally):
+ *     ├── WorkspaceChip            («选择工作区» chip, host-owned hardcode)
+ *     ├── conversation.hero.workspace ← our button lives here
+ *     └── conversation.hero.agentPreset (「模式选择」, official)
+ *
+ * `conversation.hero.workspace` (kind: single, scope: root) has NO official
+ * registrant in the current host, so with `priority: -1` ours is the only
+ * (and therefore winning) entry — it renders right after the chip and before
+ * 「模式选择」. No official UI is shadowed: the picker menu is driven by the
+ * host's own WorkspaceChip + pickerOpen state, and the slot's injected props
+ * (open/anchorRef/selectedId/onPick/onClose) are simply ignored by our chip.
+ * (v4 used this same seat but with heavy UI intervention — host-chip hiding,
+ * custom popover, fiber unlocking; v8 keeps the v7 pure-chip approach.)
  *
  * Click flow (all official APIs, unchanged from v6):
  *   1. POST /api/temp-cwd/mkdir        → host creates a temp directory
@@ -98,14 +106,18 @@ export function apply(ctx: any): void {
 
   // The one and only UI this plugin adds: a 「新建临时对话」 button sitting
   // right after the host's 「选择工作区」 chip in the hero row.
-  // The agentPreset seat is free in this profile (agent-preset not enabled);
-  // priority 1 vs the official default 0 means the official seat wins if it
-  // ever gets enabled — lowest priority renders.
-  ctx.slots.inject('conversation.hero.agentPreset', () =>
+  // v7 used conversation.hero.agentPreset but the official agent-preset
+  // plugin owns that seat at default priority 0 (the 「模式选择」 chip) —
+  // lowest priority renders, so our priority-1 entry was shadowed. v8 moves
+  // to conversation.hero.workspace, which has no official registrant: at
+  // priority -1 ours is the sole (winning) entry, rendering between the
+  // chip and 「模式选择」. The slot's picker props (open/anchorRef/onPick/
+  // onClose) are ignored by our chip.
+  ctx.slots.inject('conversation.hero.workspace', () =>
     ctx.slots.register(
       {
-        name: 'conversation.hero.agentPreset',
-        priority: 1,
+        name: 'conversation.hero.workspace',
+        priority: -1,
         inject: () => ({
           /** Official session controller: create({ workspaceId }) / open(id). */
           sessions,
