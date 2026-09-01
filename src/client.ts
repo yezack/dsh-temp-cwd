@@ -1,34 +1,44 @@
 /**
- * dsh-temp-cwd — browser half (v8).
+ * dsh-temp-cwd — browser half (v9).
  *
- * v6 put the single 「新建临时对话」 button in the sidebar footer
- * (`sidebar.footer.action`). The user wants it next to the host's
- * 「选择工作区」 chip in the hero row instead (主界面顶部 chip 的后面).
+ * v7/v8 tried to put the button in the hero row next to the host's
+ * 「选择工作区」 chip — BOTH failed, for two different structural reasons:
  *
- * v7 tried `conversation.hero.agentPreset` — FAILED in the real desktop:
- * that seat is registered by the official agent-preset plugin (default
- * `priority: 0`, the 「模式选择」 chip the user actually sees), while we
- * registered at `priority: 1`. The slots kernel renders the LOWEST priority
- * entry of a single seat ("register at a different priority to shadow it
- * (lowest renders)") — the official seat won and our button silently
- * disappeared behind 「模式选择」.
+ *   v7 used `conversation.hero.agentPreset`: the official agent-preset
+ *   plugin owns that seat at default priority 0 (the 「模式选择」 chip the
+ *   user actually sees); we registered at priority 1. The slots kernel
+ *   renders the LOWEST priority entry of a single seat — the official seat
+ *   won and our button was silently shadowed.
  *
- * v8 moves to `conversation.hero.workspace` instead. The hero row is:
+ *   v8 used `conversation.hero.workspace`: the official
+ *   dsh-client-ui-workspace package registers the WorkspacePicker MENU on
+ *   that seat (also priority 0). We registered at priority -1, won, and in
+ *   doing so SHADOWED the official picker — 「选择工作区」 became unclickable
+ *   (clicking the chip toggles pickerOpen, but the menu that should render
+ *   in that seat was gone).
  *
- *   heroWorkspaceRow (rendered whenever the hero is up, both slots
- *   unconditionally):
- *     ├── WorkspaceChip            («选择工作区» chip, host-owned hardcode)
- *     ├── conversation.hero.workspace ← our button lives here
- *     └── conversation.hero.agentPreset (「模式选择」, official)
+ * Both hero seats are single/root and claimed by official packages at
+ * priority 0. The slots kernel forbids same-priority double registration
+ * (throws) and renders only the lowest-priority winner otherwise — there is
+ * NO third seat in the hero row, so a pure-slot button cannot live there
+ * without breaking official UI. (v4 did it with fiber/DOM intervention,
+ * which v6 deliberately removed.)
  *
- * `conversation.hero.workspace` (kind: single, scope: root) has NO official
- * registrant in the current host, so with `priority: -1` ours is the only
- * (and therefore winning) entry — it renders right after the chip and before
- * 「模式选择」. No official UI is shadowed: the picker menu is driven by the
- * host's own WorkspaceChip + pickerOpen state, and the slot's injected props
- * (open/anchorRef/selectedId/onPick/onClose) are simply ignored by our chip.
- * (v4 used this same seat but with heavy UI intervention — host-chip hiding,
- * custom popover, fiber unlocking; v8 keeps the v7 pure-chip approach.)
+ * v9 therefore returns the button to `sidebar.footer.action` — a LIST seat
+ * (kind: list, scope: root, rendered by dsh-client-ui-sidebar), where the
+ * official cordis-panel entry and ours coexist instead of fighting:
+ *
+ *   sidebar.footer.action entries (both render, priority-ordered):
+ *     ├── cordis-panel (official, id "cordis-panel")
+ *     └── temp-cwd     (ours)  ← 「新建临时对话」
+ *
+ * New in v9 — visibility rule: the button only renders while the CURRENT
+ * session is not attached to any workspace (`workspaces.items` contains no
+ * workspace whose sessionIds includes the current session). Once a session
+ * has a workspace the button disappears; it reappears for the ungrouped /
+ * no-session state. Implementation is reactive via the official stores:
+ * `useSyncExternalStore(workspaces.subscribe, workspaces.getSnapshot)` for
+ * the workspace list and the same for `sessions.list` (current session id).
  *
  * Click flow (all official APIs, unchanged from v6):
  *   1. POST /api/temp-cwd/mkdir        → host creates a temp directory
@@ -104,20 +114,18 @@ export function apply(ctx: any): void {
     }
   })
 
-  // The one and only UI this plugin adds: a 「新建临时对话」 button sitting
-  // right after the host's 「选择工作区」 chip in the hero row.
-  // v7 used conversation.hero.agentPreset but the official agent-preset
-  // plugin owns that seat at default priority 0 (the 「模式选择」 chip) —
-  // lowest priority renders, so our priority-1 entry was shadowed. v8 moves
-  // to conversation.hero.workspace, which has no official registrant: at
-  // priority -1 ours is the sole (winning) entry, rendering between the
-  // chip and 「模式选择」. The slot's picker props (open/anchorRef/onPick/
-  // onClose) are ignored by our chip.
-  ctx.slots.inject('conversation.hero.workspace', () =>
+  // The one and only UI this plugin adds: a 「新建临时对话」 sidebar footer
+  // action. `sidebar.footer.action` is a LIST seat (dsh-client-ui-sidebar
+  // declares kind: list), so the official cordis-panel entry and ours coexist
+  // instead of shadowing each other — unlike the single hero seats that
+  // v7/v8 fought over and broke. No priority needed (both default to 0).
+  // Visibility: the button hides itself while the current session is bound
+  // to a workspace (see TempSessionButton).
+  ctx.slots.inject('sidebar.footer.action', () =>
     ctx.slots.register(
       {
-        name: 'conversation.hero.workspace',
-        priority: -1,
+        name: 'sidebar.footer.action',
+        id: 'temp-cwd',
         inject: () => ({
           /** Official session controller: create({ workspaceId }) / open(id). */
           sessions,
@@ -192,14 +200,41 @@ function armCleanup(sessions: any, workspaces: any, workspaceId: string, session
 }
 
 /**
- * Hero-row action — the single button this plugin adds, styled as a chip so
- * it sits naturally next to the host's 「选择工作区」 chip (host tokens only).
+ * Sidebar footer action — the single button this plugin adds. Renders only
+ * while the current session is NOT attached to any workspace:
+ *   - no session at all            → visible (the whole point of the button)
+ *   - blank/active ungrouped       → visible
+ *   - current session has a workspace → hidden (v9 visibility rule)
+ * State is reactive: the workspace list store (`workspaces.subscribe`) tells
+ * us which workspaces own which sessionIds; the session list store
+ * (`sessions.list`) tells us the current session id.
  */
 function TempSessionButton(props: any) {
-  const { sessions, workspaces } = props
+  const { sessions, workspaces, sessionsList } = props
   const [busy, setBusy] = React.useState(false)
   const [hovered, setHovered] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
+
+  // Reactive workspace list: `{ items, archivedSessionIds, ... }` snapshot.
+  // getSnapshot() returns the controller's cached snapshot object, so this
+  // is safe for useSyncExternalStore (stable reference between invalidations).
+  const wsSnap = React.useSyncExternalStore(
+    (listener: () => void) => workspaces.subscribe(listener),
+    () => workspaces.getSnapshot(),
+  )
+  // Reactive session list: `{ items, current, ... }` — current session id.
+  const sesSnap = React.useSyncExternalStore(
+    (listener: () => void) => sessionsList.subscribe(listener),
+    () => sessionsList.getSnapshot(),
+  )
+
+  // Hide while the current session is bound to a workspace.
+  const currentSessionId = sesSnap.current as string | undefined
+  const boundWorkspace =
+    currentSessionId === undefined
+      ? undefined
+      : wsSnap.items.find((w: any) => w.sessionIds.includes(currentSessionId))
+  if (boundWorkspace !== undefined) return null
 
   const handle = async () => {
     if (busy) return
@@ -228,13 +263,13 @@ function TempSessionButton(props: any) {
         onMouseLeave: () => setHovered(false),
         title: '创建临时工作区并直接开始对话（发出第一条消息后自动进入未分组）',
         style: {
-          ...chipButtonStyle,
+          ...actionButtonStyle,
           background: hovered ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
           opacity: busy ? 0.65 : 1,
           cursor: busy ? 'wait' : 'pointer',
         },
       },
-      folderPlusIcon(),
+      plusIcon(),
       busy ? '创建中…' : '新建临时对话',
     ),
     error
@@ -245,8 +280,8 @@ function TempSessionButton(props: any) {
 
 /* ---- helpers ---- */
 
-/** Minimal lucide-style folder-plus glyph. */
-function folderPlusIcon() {
+/** Minimal lucide-style plus glyph. */
+function plusIcon() {
   return React.createElement(
     'svg',
     {
@@ -260,36 +295,37 @@ function folderPlusIcon() {
       strokeLinejoin: 'round',
       style: { flexShrink: 0 },
     },
-    React.createElement('path', {
-      d: 'M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z',
-    }),
-    React.createElement('line', { x1: '12', y1: '11', x2: '12', y2: '17' }),
-    React.createElement('line', { x1: '9', y1: '14', x2: '15', y2: '14' }),
+    React.createElement('path', { d: 'M5 12h14' }),
+    React.createElement('path', { d: 'M12 5v14' }),
   )
 }
 
 /* ---- inline styles (host design tokens only) ---- */
 
-/** Chip-like action button, harmonized with the host's workspace chip. */
-const chipButtonStyle = {
-  display: 'inline-flex',
+/** Full-width sidebar footer action, harmonized with the host's footer. */
+const actionButtonStyle = {
+  display: 'flex',
   alignItems: 'center',
   gap: 6,
-  marginLeft: 8,
-  padding: '4px 10px',
+  width: '100%',
+  boxSizing: 'border-box',
+  minWidth: 0,
+  padding: '6px 8px',
   borderRadius: 8,
-  border: '1px solid var(--dsw-alias-stroke-strong, rgba(128, 128, 128, 0.35))',
+  border: 'none',
   color: 'var(--dsw-alias-label-secondary)',
   fontSize: 13,
   fontWeight: 500,
   lineHeight: '20px',
+  textAlign: 'left',
   whiteSpace: 'nowrap',
-  fontFamily: 'inherit',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
 }
 
 const errorStyle = {
   color: 'var(--dsw-alias-danger, #f56c6c)',
   fontSize: 12,
   lineHeight: '16px',
-  padding: '2px 0 0 8px',
+  padding: '2px 8px 4px',
 }

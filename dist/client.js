@@ -65,11 +65,11 @@ function apply(ctx) {
     }
   });
   ctx.slots.inject(
-    "conversation.hero.workspace",
+    "sidebar.footer.action",
     () => ctx.slots.register(
       {
-        name: "conversation.hero.workspace",
-        priority: -1,
+        name: "sidebar.footer.action",
+        id: "temp-cwd",
         inject: () => ({
           /** Official session controller: create({ workspaceId }) / open(id). */
           sessions,
@@ -117,10 +117,21 @@ function armCleanup(sessions, workspaces, workspaceId, sessionId) {
   });
 }
 function TempSessionButton(props) {
-  const { sessions, workspaces } = props;
+  const { sessions, workspaces, sessionsList } = props;
   const [busy, setBusy] = React.useState(false);
   const [hovered, setHovered] = React.useState(false);
   const [error, setError] = React.useState(null);
+  const wsSnap = React.useSyncExternalStore(
+    (listener) => workspaces.subscribe(listener),
+    () => workspaces.getSnapshot()
+  );
+  const sesSnap = React.useSyncExternalStore(
+    (listener) => sessionsList.subscribe(listener),
+    () => sessionsList.getSnapshot()
+  );
+  const currentSessionId = sesSnap.current;
+  const boundWorkspace = currentSessionId === void 0 ? void 0 : wsSnap.items.find((w) => w.sessionIds.includes(currentSessionId));
+  if (boundWorkspace !== void 0) return null;
   const handle = async () => {
     if (busy) return;
     setBusy(true);
@@ -147,19 +158,19 @@ function TempSessionButton(props) {
         onMouseLeave: () => setHovered(false),
         title: "\u521B\u5EFA\u4E34\u65F6\u5DE5\u4F5C\u533A\u5E76\u76F4\u63A5\u5F00\u59CB\u5BF9\u8BDD\uFF08\u53D1\u51FA\u7B2C\u4E00\u6761\u6D88\u606F\u540E\u81EA\u52A8\u8FDB\u5165\u672A\u5206\u7EC4\uFF09",
         style: {
-          ...chipButtonStyle,
+          ...actionButtonStyle,
           background: hovered ? "var(--dsw-alias-interactive-bg-hover)" : "transparent",
           opacity: busy ? 0.65 : 1,
           cursor: busy ? "wait" : "pointer"
         }
       },
-      folderPlusIcon(),
+      plusIcon(),
       busy ? "\u521B\u5EFA\u4E2D\u2026" : "\u65B0\u5EFA\u4E34\u65F6\u5BF9\u8BDD"
     ),
     error ? React.createElement("div", { role: "alert", style: errorStyle }, error) : null
   );
 }
-function folderPlusIcon() {
+function plusIcon() {
   return React.createElement(
     "svg",
     {
@@ -173,33 +184,34 @@ function folderPlusIcon() {
       strokeLinejoin: "round",
       style: { flexShrink: 0 }
     },
-    React.createElement("path", {
-      d: "M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"
-    }),
-    React.createElement("line", { x1: "12", y1: "11", x2: "12", y2: "17" }),
-    React.createElement("line", { x1: "9", y1: "14", x2: "15", y2: "14" })
+    React.createElement("path", { d: "M5 12h14" }),
+    React.createElement("path", { d: "M12 5v14" })
   );
 }
-var chipButtonStyle = {
-  display: "inline-flex",
+var actionButtonStyle = {
+  display: "flex",
   alignItems: "center",
   gap: 6,
-  marginLeft: 8,
-  padding: "4px 10px",
+  width: "100%",
+  boxSizing: "border-box",
+  minWidth: 0,
+  padding: "6px 8px",
   borderRadius: 8,
-  border: "1px solid var(--dsw-alias-stroke-strong, rgba(128, 128, 128, 0.35))",
+  border: "none",
   color: "var(--dsw-alias-label-secondary)",
   fontSize: 13,
   fontWeight: 500,
   lineHeight: "20px",
+  textAlign: "left",
   whiteSpace: "nowrap",
-  fontFamily: "inherit"
+  overflow: "hidden",
+  textOverflow: "ellipsis"
 };
 var errorStyle = {
   color: "var(--dsw-alias-danger, #f56c6c)",
   fontSize: 12,
   lineHeight: "16px",
-  padding: "2px 0 0 8px"
+  padding: "2px 8px 4px"
 };
 
 		return module.exports;

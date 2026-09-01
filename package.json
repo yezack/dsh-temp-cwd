@@ -27,7 +27,8 @@
     }
   },
   "scripts": {
-    "build": "node scripts/build.mjs"
+    "build": "node scripts/build.mjs",
+    "verify": "node scripts/verify-client.cjs"
   },
   "dependencies": {
     "schemastery": "^3.18.0"
