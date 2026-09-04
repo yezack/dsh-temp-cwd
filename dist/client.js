@@ -42,7 +42,7 @@ module.exports = __toCommonJS(client_exports);
 var React = __toESM(require("react"), 1);
 var name = "temp-cwd-client";
 var inject = ["slots", "sessions", "workspaces", "uiWorkspace"];
-var tempWorkspaceId = null;
+var tempPending = null;
 var HERO_ROW_SELECTOR = '[class*="heroWorkspaceRow"]';
 var PILL_CSS_ID = "@yezack/dsh-temp-cwd/pill.css";
 var PILL_TITLE = "创建临时工作区并直接开始对话（发送首条消息后自动归入未分组）";
@@ -59,13 +59,13 @@ function apply(ctx) {
     originalStartSession(workspaceId);
   };
   ctx.on("dispose", () => {
-    if (tempWorkspaceId !== null) {
-      const id = tempWorkspaceId;
-      tempWorkspaceId = null;
-      workspaces.delete(id).catch((err) => {
-        console.error("[temp-cwd] dispose cleanup failed:", err);
-      });
-    }
+    if (tempPending === null) return;
+    const pending = tempPending;
+    tempPending = null;
+    hostRemoveDir(pending.path);
+    workspaces.delete(pending.workspaceId).catch((err) => {
+      console.error("[temp-cwd] dispose cleanup failed:", err);
+    });
   });
   ensurePillStyle();
   ctx.slots.inject(
@@ -93,34 +93,71 @@ async function createTempSession(sessions, workspaces) {
   if (!res.ok) throw new Error(`mkdir failed: ${res.status}`);
   const { path } = await res.json();
   const workspace = await workspaces.create({ path });
-  tempWorkspaceId = workspace.workspaceId;
+  tempPending = { workspaceId: workspace.workspaceId, path };
   try {
     const sessionId = await sessions.create({ workspaceId: workspace.workspaceId });
     await sessions.open(sessionId);
-    armCleanup(sessions, workspaces, workspace.workspaceId, sessionId);
+    armCleanup(sessions, workspaces, workspace.workspaceId, path, sessionId);
   } catch (err) {
-    if (tempWorkspaceId === workspace.workspaceId) tempWorkspaceId = null;
-    workspaces.delete(workspace.workspaceId).catch(() => {
-    });
+    const pending = tempPending;
+    tempPending = null;
+    if (pending !== null) {
+      hostRemoveDir(pending.path);
+      workspaces.delete(pending.workspaceId).catch(() => {
+      });
+    }
     throw err;
   }
 }
-function armCleanup(sessions, workspaces, workspaceId, sessionId) {
+async function hostRemoveDir(path) {
+  try {
+    const res = await fetch(`/api/temp-cwd/remove-dir?p=${encodeURIComponent(path)}`, {
+      method: "POST"
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      console.warn(`[temp-cwd] remove-dir refused (${res.status}):`, body.reason ?? res.status);
+    }
+  } catch (err) {
+    console.warn("[temp-cwd] remove-dir request failed:", err);
+  }
+}
+async function hostRemoveMarker(path) {
+  try {
+    const res = await fetch(`/api/temp-cwd/remove-marker?p=${encodeURIComponent(path)}`, {
+      method: "POST"
+    });
+    if (!res.ok) console.warn(`[temp-cwd] remove-marker failed (${res.status})`);
+  } catch (err) {
+    console.warn("[temp-cwd] remove-marker request failed:", err);
+  }
+}
+function armCleanup(sessions, workspaces, workspaceId, path, sessionId) {
   let done = false;
   const dispose = sessions.list.subscribe(() => {
     if (done) return;
     const snap = sessions.list.getSnapshot();
     const items = Array.isArray(snap?.items) ? snap.items : [];
     const entry = items.find((item) => item.sessionId === sessionId);
-    if (snap?.current !== sessionId || entry && entry.blank === false) {
-      done = true;
-      dispose();
-      if (tempWorkspaceId === workspaceId) tempWorkspaceId = null;
-      console.info("[temp-cwd] cleanup: deleting workspace", workspaceId);
-      workspaces.delete(workspaceId).then(
-        () => console.info("[temp-cwd] cleanup: workspace deleted", workspaceId),
-        (err) => console.error("[temp-cwd] workspace cleanup failed:", err)
-      );
+    const firstMessage = entry !== void 0 && entry.blank === false;
+    const abandoned = snap?.current !== sessionId;
+    if (!firstMessage && !abandoned) return;
+    done = true;
+    dispose();
+    const pending = tempPending;
+    if (pending !== null && pending.workspaceId === workspaceId) tempPending = null;
+    if (firstMessage) {
+      console.info("[temp-cwd] first message — keeping folder, removing marker", path);
+      void hostRemoveMarker(path).then(() => {
+        console.info("[temp-cwd] marker removed; deleting workspace", workspaceId);
+        return workspaces.delete(workspaceId);
+      });
+    } else {
+      console.info("[temp-cwd] abandoned — removing whole temp folder", path);
+      void hostRemoveDir(path).then(() => {
+        console.info("[temp-cwd] folder removed; deleting workspace", workspaceId);
+        return workspaces.delete(workspaceId);
+      });
     }
   });
 }

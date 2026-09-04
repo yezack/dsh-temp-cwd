@@ -19,7 +19,7 @@ const checks = [
   ['sidebar.footer.action seat + temp-cwd id (headless host)', () =>
     /slots\.inject\(\s*["']sidebar\.footer\.action["']/.test(code) &&
     /id:\s*["']temp-cwd["']/.test(code)],
-  ['workspaces.create + delete', () => code.includes('workspaces.create({ path })') && code.includes('workspaces.delete(workspace.workspaceId)')],
+  ['workspaces.create + delete', () => code.includes('workspaces.create({ path })') && /workspaces\.delete\(/.test(code)],
   ['sessions.create workspaceId', () => code.includes('sessions.create({ workspaceId: workspace.workspaceId })')],
   ['blank-first-message cleanup (defensive items read)', () => code.includes('sessions.list.subscribe') && code.includes('entry.blank === false') && /snap\??\.current !== sessionId/.test(code) && code.includes('Array.isArray(snap')],
   ['startSession wrapper', () => code.includes('startSession = (workspaceId) => {') && code.includes('sessions.clear()')],
@@ -37,6 +37,18 @@ const checks = [
     code.includes('useSessionList') &&
     !code.includes('useSyncExternalStore')],
   ['sessionIds binding check (official ui lookup)', () => code.includes('sessionIds.includes')],
+  ['marker lifecycle host endpoints (v12)', () =>
+    code.includes('/api/temp-cwd/remove-dir?p=') &&
+    code.includes('/api/temp-cwd/remove-marker?p=') &&
+    code.includes('hostRemoveDir') &&
+    code.includes('hostRemoveMarker')],
+  ['tempPending state (workspaceId + path)', () =>
+    code.includes('tempPending') &&
+    code.includes('workspaceId: workspace.workspaceId, path')],
+  ['first-message keeps folder / abandon removes folder', () =>
+    code.includes('firstMessage') &&
+    code.includes('abandoned') &&
+    code.includes('Array.isArray(snap')],
   ['zero react-dom (pure-DOM pill)', () =>
     !code.includes('react-dom') &&
     !code.includes('createPortal')],

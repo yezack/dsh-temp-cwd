@@ -1,39 +1,38 @@
 /**
- * dsh-temp-cwd — browser half (v11).
+ * dsh-temp-cwd — browser half (v12).
  *
  * Placement (user-confirmed): the 「开始临时对话」 pill stays inside the
  * official hero chip row (`heroWorkspaceRow`), because that row has no
  * injectable seat — both hero seats (`conversation.hero.workspace` /
  * `conversation.hero.agentPreset`) are single/root and occupied by official
- * packages, so a slot cell can never coexist there (v7/v8/v9 history). v11
- * keeps the single DOM append (one plain `<button data-temp-cwd>` in the row)
- * but officializes everything around it:
+ * packages, so a slot cell can never coexist there (v7/v8/v9 history). The
+ * pill is one plain DOM `<button data-temp-cwd>` appended into the row.
  *
- *  - Store consumption goes through the official inject `hooks` compartment.
- *    The slot renderer turns bare Observable sources (`subscribe` /
- *    `getSnapshot`) into selector props (`useWorkspaceList`,
- *    `useSessionList`) — components never reach into models directly and
- *    never call `useSyncExternalStore` themselves (renderer does it).
- *    v10 crashed exactly here: it called `workspaces.getSnapshot` on the
- *    *controller* (`ctx.workspaces`), which only has commands
- *    (create/delete/rename); `subscribe`/`getSnapshot` live on the model
- *    exposed as `ctx.workspaces.list` (and `ctx.sessions.list`).
- *  - Services stay in the `apply` closure; components receive only
- *    callbacks (`onStartTemp`) plus bound selector hooks.
- *  - The headless host registers on the `sidebar.footer.action` LIST seat
- *    (id `temp-cwd`) purely for lifecycle — it renders nothing there.
+ * Store consumption is official: the headless host component (registered on
+ * the `sidebar.footer.action` LIST seat, renders nothing) reads the models
+ * through the renderer-bound selector props `useWorkspaceList` /
+ * `useSessionList`, which come from the inject `hooks` compartment
+ * (`workspaceList: ctx.workspaces.list`, `sessionList: ctx.sessions.list`).
+ * Services (controllers) never cross into React — actions stay in `apply`.
+ * v10 crashed with `workspaces.getSnapshot is not a function` because it
+ * called subscribe/getSnapshot on the controller instead of the model.
  *
- * Click flow (unchanged from v6+): host mkdir → `workspaces.create({ path })`
- * → `sessions.create({ workspaceId })` → `sessions.open` → deferred cleanup
- * after the first message (blank → false) or after switching away. Cleanup
- * subscribes to `sessions.list` at apply level (model API, not React).
+ * Temp-folder lifecycle (v12, marker-based):
  *
- * Visibility rule: the pill mounts only while the hero row exists AND the
- * current session is not attached to any workspace (`workspace.sessionIds`
- * lookup — the same binding check the official ui-workspace / ui-conversation
- * code uses). Since the row unmounts when a session binds a workspace, this
- * is belt & braces; a 1.2 s interval self-heals the pill after React
- * reconciliation disturbs the appended foreign child.
+ *   1. Click pill → host `mkdir` creates <root>/<timestamp> AND writes a
+ *      `.TEMP_WORKSPACE` marker inside it.
+ *   2. Adopt the folder as a real workspace (`workspaces.create({ path })`),
+ *      create + open a session attached to it — the composer renders 100%
+ *      native. `tempPending` remembers { workspaceId, path }.
+ *   3. First message sent (blank → false): the session is real now. The
+ *      plugin removes the marker (host remove-marker) and deletes the
+ *      workspace — the session falls into 「未分组」 and the folder is kept.
+ *   4. Abandoned before the first message (switch away, un-argued
+ *      "new session" clears it, or plugin dispose): the folder still carries
+ *      the marker, so the host removes the WHOLE directory (remove-dir) —
+ *      empty temp dirs can no longer accumulate. Workspaces.delete removes
+ *      the sidebar entry; files/folders created inside before that point are
+ *      discarded too (marker = "abandoned scaffold, safe to remove entirely").
  */
 
 import * as React from 'react'
@@ -45,10 +44,11 @@ export const name = 'temp-cwd-client'
 export const inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace']
 
 /**
- * Module-level pending temp workspace id. While set, the dispose hook and the
- * flow own it; cleared as soon as the cleanup fires.
+ * The pending temp workspace (created, not yet finalized by first message or
+ * by abandon cleanup). Cleared when cleanup fires; the dispose hook uses it
+ * as a safety net (app closing while a temp session is still blank).
  */
-let tempWorkspaceId: string | null = null
+let tempPending: { workspaceId: string; path: string } | null = null
 
 /** The official hero chip row carries this CSS-module suffix (hash-prefixed). */
 const HERO_ROW_SELECTOR = '[class*="heroWorkspaceRow"]'
@@ -78,24 +78,25 @@ export function apply(ctx: any): void {
   }
 
   // Safety net: if the plugin is disposed while a temp workspace is still
-  // pending (e.g. the app closes before the first message), remove it.
+  // pending (app closes before the first message), the folder is still an
+  // abandoned scaffold (marker present) → remove the whole directory, then
+  // delete the workspace. If the marker is already gone the host no-ops.
   ctx.on('dispose', () => {
-    if (tempWorkspaceId !== null) {
-      const id = tempWorkspaceId
-      tempWorkspaceId = null
-      workspaces.delete(id).catch((err: any) => {
-        console.error('[temp-cwd] dispose cleanup failed:', err)
-      })
-    }
+    if (tempPending === null) return
+    const pending = tempPending
+    tempPending = null
+    hostRemoveDir(pending.path)
+    workspaces.delete(pending.workspaceId).catch((err: any) => {
+      console.error('[temp-cwd] dispose cleanup failed:', err)
+    })
   })
 
   ensurePillStyle()
 
   // Headless host on the official sidebar.footer.action LIST seat (renders
-  // nothing visible). Entry-owned `inject` projects:
-  //   hooks: { workspaceList, sessionList } — bare models; renderer binds
-  //          them into useWorkspaceList/useSessionList selector props.
-  //   onStartTemp — the temp-session action, kept in the apply closure.
+  // nothing visible). Entry-owned `inject` projects the two bare models as
+  // hook sources (renderer binds useWorkspaceList / useSessionList) plus the
+  // temp-session action kept in the apply closure.
   ctx.slots.inject('sidebar.footer.action', () =>
     ctx.slots.register(
       {
@@ -117,19 +118,18 @@ export function apply(ctx: any): void {
 }
 
 /**
- * Create the temp workspace + session, open it, and arm the deferred cleanup
- * (delete the workspace once the session leaves `blank` or the user switches
- * away). All official API calls; nothing touches the DOM.
+ * Create the temp workspace + session, open it, and arm the deferred cleanup.
+ * The host mkdir route creates the folder AND the .TEMP_WORKSPACE marker.
  */
 async function createTempSession(sessions: any, workspaces: any): Promise<void> {
-  // 1. Ask the host for a fresh timestamped temp directory.
+  // 1. Ask the host for a fresh timestamped temp directory (+ marker).
   const res = await fetch('/api/temp-cwd/mkdir', { method: 'POST' })
   if (!res.ok) throw new Error(`mkdir failed: ${res.status}`)
   const { path } = (await res.json()) as { path: string }
 
   // 2. Adopt it as a real workspace — the composer renders natively from now on.
   const workspace = await workspaces.create({ path })
-  tempWorkspaceId = workspace.workspaceId
+  tempPending = { workspaceId: workspace.workspaceId, path }
 
   try {
     // 3. Session attached to that workspace.
@@ -138,22 +138,64 @@ async function createTempSession(sessions: any, workspaces: any): Promise<void> 
     // 4. Open it — native InputBar / Lexical composer, chip shows a real title.
     await sessions.open(sessionId)
 
-    // 5. Deferred cleanup: first message (blank → false) or switch away.
-    armCleanup(sessions, workspaces, workspace.workspaceId, sessionId)
+    // 5. Deferred cleanup: first message finalizes the folder (marker →
+    //    removed), abandoning it removes the whole folder (marker → delete).
+    armCleanup(sessions, workspaces, workspace.workspaceId, path, sessionId)
   } catch (err) {
-    // Session create/open failed — don't leave a dangling workspace behind.
-    if (tempWorkspaceId === workspace.workspaceId) tempWorkspaceId = null
-    workspaces.delete(workspace.workspaceId).catch(() => {})
+    // Session create/open failed — roll the abandoned scaffold back fully.
+    const pending = tempPending
+    tempPending = null
+    if (pending !== null) {
+      hostRemoveDir(pending.path)
+      workspaces.delete(pending.workspaceId).catch(() => {})
+    }
     throw err
   }
 }
 
 /**
- * Subscribe to the session list model and delete the temp workspace at the
- * first moment it is safe (first message sent, or the user switched away).
- * Torn down on first match; delete is fire-and-forget (logged on failure).
+ * Host calls (fire-and-forget; failures only log — never block the UI).
  */
-function armCleanup(sessions: any, workspaces: any, workspaceId: string, sessionId: string): void {
+async function hostRemoveDir(path: string): Promise<void> {
+  try {
+    const res = await fetch(`/api/temp-cwd/remove-dir?p=${encodeURIComponent(path)}`, {
+      method: 'POST',
+    })
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { reason?: string }
+      console.warn(`[temp-cwd] remove-dir refused (${res.status}):`, body.reason ?? res.status)
+    }
+  } catch (err) {
+    console.warn('[temp-cwd] remove-dir request failed:', err)
+  }
+}
+
+async function hostRemoveMarker(path: string): Promise<void> {
+  try {
+    const res = await fetch(`/api/temp-cwd/remove-marker?p=${encodeURIComponent(path)}`, {
+      method: 'POST',
+    })
+    if (!res.ok) console.warn(`[temp-cwd] remove-marker failed (${res.status})`)
+  } catch (err) {
+    console.warn('[temp-cwd] remove-marker request failed:', err)
+  }
+}
+
+/**
+ * Subscribe to the session list model and finalize the temp workspace at the
+ * first moment it is safe:
+ *   - first message (`entry.blank === false`): real session — remove the
+ *     marker (folder is kept) and delete the workspace (session → 未分组);
+ *   - switch away / clear (`snap.current !== sessionId`): abandoned — remove
+ *     the whole folder (marker authorizes it) and delete the workspace.
+ */
+function armCleanup(
+  sessions: any,
+  workspaces: any,
+  workspaceId: string,
+  path: string,
+  sessionId: string,
+): void {
   let done = false
   const dispose = sessions.list.subscribe(() => {
     if (done) return
@@ -161,19 +203,32 @@ function armCleanup(sessions: any, workspaces: any, workspaceId: string, session
     // The session-list store is seeded as { ids, byId, current, phase, … }
     // and only gains `items` after the first projection; a transient reset
     // (e.g. sessions.clear()) can notify with `items` undefined. Never read
-    // `.items` unguarded — a listener throw here would skip the delete and
-    // leak the temp workspace.
+    // `.items` unguarded — a listener throw here would skip cleanup and leak
+    // the temp workspace.
     const items = Array.isArray(snap?.items) ? snap.items : []
     const entry = items.find((item: any) => item.sessionId === sessionId)
-    if (snap?.current !== sessionId || (entry && entry.blank === false)) {
-      done = true
-      dispose()
-      if (tempWorkspaceId === workspaceId) tempWorkspaceId = null
-      console.info('[temp-cwd] cleanup: deleting workspace', workspaceId)
-      workspaces.delete(workspaceId).then(
-        () => console.info('[temp-cwd] cleanup: workspace deleted', workspaceId),
-        (err: any) => console.error('[temp-cwd] workspace cleanup failed:', err),
-      )
+    const firstMessage = entry !== undefined && entry.blank === false
+    const abandoned = snap?.current !== sessionId
+    if (!firstMessage && !abandoned) return
+
+    done = true
+    dispose()
+    const pending = tempPending
+    if (pending !== null && pending.workspaceId === workspaceId) tempPending = null
+
+    // Finalize the folder first, then remove the sidebar workspace entry.
+    if (firstMessage) {
+      console.info('[temp-cwd] first message — keeping folder, removing marker', path)
+      void hostRemoveMarker(path).then(() => {
+        console.info('[temp-cwd] marker removed; deleting workspace', workspaceId)
+        return workspaces.delete(workspaceId)
+      })
+    } else {
+      console.info('[temp-cwd] abandoned — removing whole temp folder', path)
+      void hostRemoveDir(path).then(() => {
+        console.info('[temp-cwd] folder removed; deleting workspace', workspaceId)
+        return workspaces.delete(workspaceId)
+      })
     }
   })
 }
