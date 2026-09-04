@@ -21,7 +21,7 @@ const checks = [
     /id:\s*["']temp-cwd["']/.test(code)],
   ['workspaces.create + delete', () => code.includes('workspaces.create({ path })') && code.includes('workspaces.delete(workspace.workspaceId)')],
   ['sessions.create workspaceId', () => code.includes('sessions.create({ workspaceId: workspace.workspaceId })')],
-  ['blank-first-message cleanup', () => code.includes('sessions.list.subscribe') && code.includes('entry.blank === false') && code.includes('snap.current !== sessionId')],
+  ['blank-first-message cleanup (defensive items read)', () => code.includes('sessions.list.subscribe') && code.includes('entry.blank === false') && /snap\??\.current !== sessionId/.test(code) && code.includes('Array.isArray(snap')],
   ['startSession wrapper', () => code.includes('startSession = (workspaceId) => {') && code.includes('sessions.clear()')],
   ['no hero seat shadowing', () =>
     !/slots\.inject\(["']conversation\.hero/.test(code) &&

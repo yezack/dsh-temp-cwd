@@ -158,14 +158,22 @@ function armCleanup(sessions: any, workspaces: any, workspaceId: string, session
   const dispose = sessions.list.subscribe(() => {
     if (done) return
     const snap = sessions.list.getSnapshot()
-    const entry = snap.items.find((item: any) => item.sessionId === sessionId)
-    if (snap.current !== sessionId || (entry && entry.blank === false)) {
+    // The session-list store is seeded as { ids, byId, current, phase, … }
+    // and only gains `items` after the first projection; a transient reset
+    // (e.g. sessions.clear()) can notify with `items` undefined. Never read
+    // `.items` unguarded — a listener throw here would skip the delete and
+    // leak the temp workspace.
+    const items = Array.isArray(snap?.items) ? snap.items : []
+    const entry = items.find((item: any) => item.sessionId === sessionId)
+    if (snap?.current !== sessionId || (entry && entry.blank === false)) {
       done = true
       dispose()
       if (tempWorkspaceId === workspaceId) tempWorkspaceId = null
-      workspaces.delete(workspaceId).catch((err: any) => {
-        console.error('[temp-cwd] workspace cleanup failed:', err)
-      })
+      console.info('[temp-cwd] cleanup: deleting workspace', workspaceId)
+      workspaces.delete(workspaceId).then(
+        () => console.info('[temp-cwd] cleanup: workspace deleted', workspaceId),
+        (err: any) => console.error('[temp-cwd] workspace cleanup failed:', err),
+      )
     }
   })
 }
@@ -259,7 +267,7 @@ function ensurePillStyle(): void {
   tag.textContent = [
     // Exact chip look: same tokens as the official `…_workspace` chip
     // (radius 16, min-height 28, 13px/500, label-primary, hover bg).
-    'button[data-temp-cwd]{display:inline-flex;align-items:center;gap:4px;min-height:28px;max-width:min(100%,360px);box-sizing:border-box;border-radius:16px;padding:0 8px;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;font-weight:500;line-height:20px;cursor:pointer;order:2}',
+    'button[data-temp-cwd]{display:inline-flex;align-items:center;gap:4px;min-height:28px;max-width:min(100%,360px);box-sizing:border-box;border-radius:16px;padding:0 8px;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;font-weight:500;line-height:20px;cursor:pointer}',
     'button[data-temp-cwd]:hover{background:var(--dsw-alias-interactive-bg-hover)}',
     'button[data-temp-cwd][data-temp-cwd-state="busy"]{opacity:.65;cursor:wait}',
     'button[data-temp-cwd] svg{flex-shrink:0}',
@@ -348,7 +356,13 @@ function mountPill(row: HTMLElement, onStart: () => Promise<void>): HTMLButtonEl
       })
   })
 
-  row.appendChild(btn)
+  // Insert the pill immediately after the official 「选择工作区」 chip (first
+  // <button> in the row) — the row may also contain a mode/agent-preset chip
+  // (e.g. 「CTF解题模式」), so a plain append or flex `order` cannot guarantee
+  // the pill's position. Fall back to appending when no chip is found.
+  const chip = row.querySelector('button')
+  if (chip !== null) chip.after(btn)
+  else row.appendChild(btn)
   return btn
 }
 

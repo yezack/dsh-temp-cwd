@@ -110,14 +110,17 @@ function armCleanup(sessions, workspaces, workspaceId, sessionId) {
   const dispose = sessions.list.subscribe(() => {
     if (done) return;
     const snap = sessions.list.getSnapshot();
-    const entry = snap.items.find((item) => item.sessionId === sessionId);
-    if (snap.current !== sessionId || entry && entry.blank === false) {
+    const items = Array.isArray(snap?.items) ? snap.items : [];
+    const entry = items.find((item) => item.sessionId === sessionId);
+    if (snap?.current !== sessionId || entry && entry.blank === false) {
       done = true;
       dispose();
       if (tempWorkspaceId === workspaceId) tempWorkspaceId = null;
-      workspaces.delete(workspaceId).catch((err) => {
-        console.error("[temp-cwd] workspace cleanup failed:", err);
-      });
+      console.info("[temp-cwd] cleanup: deleting workspace", workspaceId);
+      workspaces.delete(workspaceId).then(
+        () => console.info("[temp-cwd] cleanup: workspace deleted", workspaceId),
+        (err) => console.error("[temp-cwd] workspace cleanup failed:", err)
+      );
     }
   });
 }
@@ -169,7 +172,7 @@ function ensurePillStyle() {
   tag.textContent = [
     // Exact chip look: same tokens as the official `…_workspace` chip
     // (radius 16, min-height 28, 13px/500, label-primary, hover bg).
-    "button[data-temp-cwd]{display:inline-flex;align-items:center;gap:4px;min-height:28px;max-width:min(100%,360px);box-sizing:border-box;border-radius:16px;padding:0 8px;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;font-weight:500;line-height:20px;cursor:pointer;order:2}",
+    "button[data-temp-cwd]{display:inline-flex;align-items:center;gap:4px;min-height:28px;max-width:min(100%,360px);box-sizing:border-box;border-radius:16px;padding:0 8px;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;font-weight:500;line-height:20px;cursor:pointer}",
     "button[data-temp-cwd]:hover{background:var(--dsw-alias-interactive-bg-hover)}",
     'button[data-temp-cwd][data-temp-cwd-state="busy"]{opacity:.65;cursor:wait}',
     "button[data-temp-cwd] svg{flex-shrink:0}",
@@ -239,7 +242,9 @@ function mountPill(row, onStart) {
       }
     });
   });
-  row.appendChild(btn);
+  const chip = row.querySelector("button");
+  if (chip !== null) chip.after(btn);
+  else row.appendChild(btn);
   return btn;
 }
 var PLUS_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>';
