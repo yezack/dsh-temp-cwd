@@ -43,6 +43,7 @@ var React = __toESM(require("react"), 1);
 var name = "temp-cwd-client";
 var inject = ["slots", "sessions", "workspaces", "uiWorkspace"];
 var tempPending = null;
+var userRequestedClear = false;
 var sweptOrphans = /* @__PURE__ */ new Set();
 var TEMP_WS_TITLE = "临时会话";
 var HERO_ROW_SELECTOR = '[class*="heroWorkspaceRow"]';
@@ -58,6 +59,7 @@ function apply(ctx) {
   const originalStartSession = uiWorkspace.startSession.bind(uiWorkspace);
   uiWorkspace.startSession = (workspaceId) => {
     if (workspaceId === void 0) {
+      userRequestedClear = true;
       sessions.clear();
       return;
     }
@@ -120,6 +122,7 @@ async function renameTempWorkspace(workspaces, workspaceId) {
   console.warn("[temp-cwd] rename to 临时会话 failed: too many name conflicts");
 }
 async function createTempSession(sessions, workspaces) {
+  userRequestedClear = false;
   await purgeStaleBeforeCreate(sessions, workspaces);
   const res = await fetch("/api/temp-cwd/mkdir", { method: "POST" });
   if (!res.ok) throw new Error(`mkdir failed: ${res.status}`);
@@ -179,7 +182,9 @@ async function purgeTempWorkspace(workspaces, workspace) {
     await workspaces.delete(workspace.workspaceId);
     console.info("[temp-cwd] purged stale temp workspace", workspace.workspaceId);
   } catch (err) {
-    console.warn("[temp-cwd] purge: workspace delete failed:", err);
+    if (!String(err?.message ?? err).includes("workspace-not-found")) {
+      console.warn("[temp-cwd] purge: workspace delete failed:", err);
+    }
   }
 }
 async function purgeStaleBeforeCreate(sessions, workspaces) {
@@ -219,7 +224,9 @@ function armCleanup(sessions, workspaces, workspaceId, path, sessionId) {
         return workspaces.delete(workspaceId);
       }
     ).catch((err) => {
-      console.warn("[temp-cwd] abandon cleanup failed:", err);
+      if (!String(err?.message ?? err).includes("workspace-not-found")) {
+        console.warn("[temp-cwd] abandon cleanup failed:", err);
+      }
     });
   };
   const dispose = sessions.list.subscribe(() => {
@@ -249,6 +256,11 @@ function armCleanup(sessions, workspaces, workspaceId, path, sessionId) {
       window.clearTimeout(abandonTimer);
       return;
     }
+    if (userRequestedClear) {
+      userRequestedClear = false;
+      finalizeAbandon();
+      return;
+    }
     if (abandonCandidate) return;
     abandonCandidate = true;
     abandonTimer = window.setTimeout(() => {
@@ -259,7 +271,7 @@ function armCleanup(sessions, workspaces, workspaceId, path, sessionId) {
         abandonCandidate = false;
         return;
       }
-      if (current2 === void 0 && !reopenedOnce && tempPending !== null) {
+      if (current2 === void 0 && !reopenedOnce && tempPending !== null && !userRequestedClear) {
         reopenedOnce = true;
         abandonCandidate = false;
         console.info("[temp-cwd] reopening temp session after watcher stole selection");

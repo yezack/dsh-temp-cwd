@@ -56,6 +56,16 @@ export const inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace']
  */
 let tempPending: { workspaceId: string; path: string } | null = null
 
+/**
+ * True right after the USER asked for a fresh conversation (un-argued
+ * startSession → our sessions.clear()). A clear that goes through our own
+ * wrapper is an explicit abandon of the current blank temp session — the
+ * abandon cleanup must run immediately and must NEVER auto-reopen it.
+ * (Only a selection stolen by the host's "restore recent workspace" watcher
+ * — which does NOT go through the wrapper — gets the grace + reopen path.)
+ */
+let userRequestedClear = false
+
 /** Workspace ids already swept this session (store churn must not double-fire). */
 const sweptOrphans = new Set<string>()
 
@@ -88,6 +98,10 @@ export function apply(ctx: any): void {
   const originalStartSession = uiWorkspace.startSession.bind(uiWorkspace)
   uiWorkspace.startSession = (workspaceId?: string) => {
     if (workspaceId === void 0) {
+      // Explicit user action (the new-session buttons). Any blank temp
+      // session currently open is thereby abandoned — remember that so the
+      // abandon cleanup finalizes immediately instead of auto-reopening it.
+      userRequestedClear = true
       sessions.clear()
       return
     }
@@ -172,6 +186,10 @@ async function renameTempWorkspace(workspaces: any, workspaceId: string): Promis
  * The host mkdir route creates the folder AND the .TEMP_WORKSPACE marker.
  */
 async function createTempSession(sessions: any, workspaces: any): Promise<void> {
+  // A fresh temp session starts with a clean slate — a previous unrelated
+  // "new session" clear must not suppress the watcher-reopen path later.
+  userRequestedClear = false
+
   // 0. Clean up leftovers first: any stale 临时会话… workspace from an
   //    interrupted run is fully purged (sessions archived, folder removed,
   //    workspace deleted) BEFORE we scaffold a new one.
@@ -264,7 +282,9 @@ async function purgeTempWorkspace(workspaces: any, workspace: any): Promise<void
     await workspaces.delete(workspace.workspaceId)
     console.info('[temp-cwd] purged stale temp workspace', workspace.workspaceId)
   } catch (err) {
-    console.warn('[temp-cwd] purge: workspace delete failed:', err)
+    if (!String(err?.message ?? err).includes('workspace-not-found')) {
+      console.warn('[temp-cwd] purge: workspace delete failed:', err)
+    }
   }
 }
 
@@ -337,7 +357,11 @@ function armCleanup(
         },
       )
       .catch((err: any) => {
-        console.warn('[temp-cwd] abandon cleanup failed:', err)
+        // workspace-not-found is expected: archiving the last session can
+        // make the host delete the now-empty workspace itself.
+        if (!String(err?.message ?? err).includes('workspace-not-found')) {
+          console.warn('[temp-cwd] abandon cleanup failed:', err)
+        }
       })
   }
 
@@ -375,11 +399,18 @@ function armCleanup(
     // "restore recent workspace" logic can steal the selection a few hundred
     // ms after we open the temp session, so don't finalize immediately —
     // wait out a grace window, and if we were only left in the no-session
-    // hero state, reopen our temp session once.
+    // hero state, reopen our temp session once. Exception: when the user
+    // explicitly clicked a new-session button (our own clear ran), that is a
+    // real abandon — finalize right away and never reopen.
     const abandoned = snap?.current !== sessionId
     if (!abandoned) {
       abandonCandidate = false
       window.clearTimeout(abandonTimer)
+      return
+    }
+    if (userRequestedClear) {
+      userRequestedClear = false
+      finalizeAbandon()
       return
     }
     if (abandonCandidate) return
@@ -393,7 +424,12 @@ function armCleanup(
         abandonCandidate = false
         return
       }
-      if (current2 === undefined && !reopenedOnce && tempPending !== null) {
+      if (
+        current2 === undefined &&
+        !reopenedOnce &&
+        tempPending !== null &&
+        !userRequestedClear
+      ) {
         // Nobody is selected (hero): the host watcher dropped our selection
         // without choosing another session — reopen the temp session once.
         // NOTE: sessions.open(id) is SYNCHRONOUS (returns void), not a
