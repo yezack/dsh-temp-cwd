@@ -45,10 +45,11 @@ const checks = [
   ['tempPending state (workspaceId + path)', () =>
     code.includes('tempPending') &&
     code.includes('workspaceId: workspace.workspaceId, path')],
-  ['first-message keeps folder / abandon removes folder', () =>
+  ['first-message keeps folder / abandon removes folder + archives session', () =>
     code.includes('firstMessage') &&
     code.includes('abandoned') &&
-    code.includes('byId[sessionId]')],
+    code.includes('byId[sessionId]') &&
+    code.includes('workspaces.archiveSession(sessionId)')],
   ['transient rename, conflict-safe (v13)', () =>
     code.includes('TEMP_WS_TITLE') &&
     code.includes('workspaces.rename(workspaceId, title)') &&

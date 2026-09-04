@@ -186,11 +186,17 @@ function armCleanup(sessions, workspaces, workspaceId, path, sessionId) {
         return workspaces.delete(workspaceId);
       });
     } else {
-      console.info("[temp-cwd] abandoned — removing whole temp folder", path);
-      void hostRemoveDir(path).then(() => {
-        console.info("[temp-cwd] folder removed; deleting workspace", workspaceId);
-        return workspaces.delete(workspaceId);
-      });
+      console.info("[temp-cwd] abandoned — removing folder + archiving session", path);
+      void hostRemoveDir(path).then(() => workspaces.archiveSession(sessionId)).then(
+        () => {
+          console.info("[temp-cwd] archived session; deleting workspace", workspaceId);
+          return workspaces.delete(workspaceId);
+        },
+        (err) => {
+          console.warn("[temp-cwd] archive failed, deleting workspace anyway:", err);
+          return workspaces.delete(workspaceId);
+        }
+      );
     }
   });
 }

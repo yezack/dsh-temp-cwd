@@ -282,11 +282,24 @@ function armCleanup(
         return workspaces.delete(workspaceId)
       })
     } else {
-      console.info('[temp-cwd] abandoned — removing whole temp folder', path)
-      void hostRemoveDir(path).then(() => {
-        console.info('[temp-cwd] folder removed; deleting workspace', workspaceId)
-        return workspaces.delete(workspaceId)
-      })
+      // Abandoned BEFORE the first message: nothing of it may remain visible
+      // in the sidebar. Remove the whole temp folder (marker authorizes it),
+      // archive the still-blank session (workspace deletion alone would drop
+      // it into 未分组 and leave the "lonely temp conversation" row), then
+      // delete the workspace.
+      console.info('[temp-cwd] abandoned — removing folder + archiving session', path)
+      void hostRemoveDir(path)
+        .then(() => workspaces.archiveSession(sessionId))
+        .then(
+          () => {
+            console.info('[temp-cwd] archived session; deleting workspace', workspaceId)
+            return workspaces.delete(workspaceId)
+          },
+          (err: any) => {
+            console.warn('[temp-cwd] archive failed, deleting workspace anyway:', err)
+            return workspaces.delete(workspaceId)
+          },
+        )
     }
   })
 }
