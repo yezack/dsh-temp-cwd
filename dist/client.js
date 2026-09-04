@@ -43,9 +43,14 @@ var React = __toESM(require("react"), 1);
 var name = "temp-cwd-client";
 var inject = ["slots", "sessions", "workspaces", "uiWorkspace"];
 var tempPending = null;
+var sweptOrphans = /* @__PURE__ */ new Set();
+var TEMP_WS_TITLE = "临时会话";
 var HERO_ROW_SELECTOR = '[class*="heroWorkspaceRow"]';
 var PILL_CSS_ID = "@yezack/dsh-temp-cwd/pill.css";
 var PILL_TITLE = "创建临时工作区并直接开始对话（发送首条消息后自动归入未分组）";
+function isTempTitle(title) {
+  return typeof title === "string" && title.startsWith(TEMP_WS_TITLE);
+}
 function apply(ctx) {
   const workspaces = ctx.workspaces;
   const sessions = ctx.sessions;
@@ -78,15 +83,42 @@ function apply(ctx) {
           hooks: {
             /** Workspace model: subscribe/getSnapshot → { items, phase, … }. */
             workspaceList: workspaces.list,
-            /** Session list model: subscribe/getSnapshot → { items, current, … }. */
+            /** Session list model: subscribe/getSnapshot → { byId, current, … }. */
             sessionList: sessions.list
           },
-          onStartTemp: () => createTempSession(sessions, workspaces)
+          onStartTemp: () => createTempSession(sessions, workspaces),
+          /** Re-arm cleanup for a temp workspace resumed after a reload. */
+          onResumeArmCleanup: (workspaceId, path, sessionId) => {
+            armCleanup(sessions, workspaces, workspaceId, path, sessionId);
+          },
+          /** Sweep a leftover temp workspace that has no sessions at all. */
+          onForgetOrphan: (workspaceId, path) => {
+            hostRemoveDir(path);
+            workspaces.delete(workspaceId).catch((err) => {
+              console.warn("[temp-cwd] orphan workspace delete failed:", err);
+            });
+          }
         })
       },
       TempCwdHost
     )
   );
+}
+async function renameTempWorkspace(workspaces, workspaceId) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const title = attempt === 0 ? TEMP_WS_TITLE : `${TEMP_WS_TITLE} ${attempt + 1}`;
+    try {
+      await workspaces.rename(workspaceId, title);
+      return;
+    } catch (err) {
+      const conflict = String(err?.message ?? err).includes("workspace-name-conflict");
+      if (!conflict) {
+        console.warn("[temp-cwd] rename to 临时会话 failed:", err);
+        return;
+      }
+    }
+  }
+  console.warn("[temp-cwd] rename to 临时会话 failed: too many name conflicts");
 }
 async function createTempSession(sessions, workspaces) {
   const res = await fetch("/api/temp-cwd/mkdir", { method: "POST" });
@@ -97,6 +129,7 @@ async function createTempSession(sessions, workspaces) {
   try {
     const sessionId = await sessions.create({ workspaceId: workspace.workspaceId });
     await sessions.open(sessionId);
+    await renameTempWorkspace(workspaces, workspace.workspaceId);
     armCleanup(sessions, workspaces, workspace.workspaceId, path, sessionId);
   } catch (err) {
     const pending = tempPending;
@@ -137,8 +170,8 @@ function armCleanup(sessions, workspaces, workspaceId, path, sessionId) {
   const dispose = sessions.list.subscribe(() => {
     if (done) return;
     const snap = sessions.list.getSnapshot();
-    const items = Array.isArray(snap?.items) ? snap.items : [];
-    const entry = items.find((item) => item.sessionId === sessionId);
+    const byId = snap?.byId !== void 0 && snap.byId !== null ? snap.byId : {};
+    const entry = byId[sessionId];
     const firstMessage = entry !== void 0 && entry.blank === false;
     const abandoned = snap?.current !== sessionId;
     if (!firstMessage && !abandoned) return;
@@ -162,25 +195,67 @@ function armCleanup(sessions, workspaces, workspaceId, path, sessionId) {
   });
 }
 function TempCwdHost(props) {
-  const { useWorkspaceList, useSessionList, onStartTemp } = props;
-  const wsItems = useWorkspaceList((snapshot) => snapshot.items);
+  const { useWorkspaceList, useSessionList, onStartTemp, onResumeArmCleanup, onForgetOrphan } = props;
+  const wsItems = useWorkspaceList(
+    (snapshot) => Array.isArray(snapshot?.items) ? snapshot.items : EMPTY_ITEMS
+  );
   const currentSessionId = useSessionList((snapshot) => snapshot.current);
-  const bound = currentSessionId !== void 0 && wsItems.some((w) => w.sessionIds.includes(currentSessionId));
+  const sessionById = useSessionList(
+    (snapshot) => snapshot?.byId !== void 0 && snapshot.byId !== null ? snapshot.byId : EMPTY_BY_ID
+  );
+  const boundWs = currentSessionId === void 0 ? void 0 : wsItems.find((w) => w.sessionIds.includes(currentSessionId));
+  const bound = boundWs !== void 0;
+  const currentEntry = currentSessionId === void 0 ? void 0 : sessionById[currentSessionId];
+  const transient = boundWs !== void 0 && isTempTitle(boundWs.title) && currentEntry !== void 0 && currentEntry.blank !== false;
   const [row, setRow] = React.useState(null);
   const pillRef = React.useRef(null);
   const rowRef = React.useRef(null);
   const boundRef = React.useRef(false);
+  const transientRef = React.useRef(false);
+  const resumedRef = React.useRef(false);
   rowRef.current = row;
   boundRef.current = bound;
+  transientRef.current = transient;
   React.useEffect(() => {
     setRow(findHeroRow());
-  }, [currentSessionId, bound]);
+  }, [currentSessionId, bound, transient]);
   React.useEffect(() => {
     removePill(pillRef);
     if (row === null || bound) return;
     pillRef.current = mountPill(row, onStartTemp);
     return () => removePill(pillRef);
   }, [row, bound, onStartTemp]);
+  React.useEffect(() => {
+    syncTransientUI(transient);
+    return () => syncTransientUI(false);
+  }, [transient]);
+  React.useEffect(() => {
+    if (resumedRef.current || currentSessionId === void 0) return;
+    const resumed = wsItems.find(
+      (w) => isTempTitle(w.title) && Array.isArray(w.sessionIds) && w.sessionIds.includes(currentSessionId) && sessionById[currentSessionId] !== void 0
+    );
+    if (resumed === void 0) return;
+    const entry = sessionById[currentSessionId];
+    if (entry === void 0 || entry.blank === false) return;
+    const alreadyPending = tempPending !== null && tempPending.workspaceId === resumed.workspaceId;
+    if (alreadyPending) return;
+    resumedRef.current = true;
+    tempPending = { workspaceId: resumed.workspaceId, path: resumed.path };
+    console.info("[temp-cwd] resumed blank temp session; re-arming cleanup", resumed.workspaceId);
+    onResumeArmCleanup(resumed.workspaceId, resumed.path, currentSessionId);
+  }, [wsItems, sessionById, currentSessionId, onResumeArmCleanup]);
+  React.useEffect(() => {
+    if (tempPending !== null) return;
+    for (const w of wsItems) {
+      if (!isTempTitle(w.title)) continue;
+      const sessionsInside = Array.isArray(w.sessionIds) ? w.sessionIds : [];
+      if (sessionsInside.length > 0) continue;
+      if (sweptOrphans.has(w.workspaceId)) continue;
+      sweptOrphans.add(w.workspaceId);
+      console.info("[temp-cwd] sweeping session-less temp workspace", w.workspaceId);
+      onForgetOrphan(w.workspaceId, w.path);
+    }
+  }, [wsItems]);
   React.useEffect(() => {
     const id = window.setInterval(() => {
       const el = findHeroRow();
@@ -196,10 +271,75 @@ function TempCwdHost(props) {
       } else if (!shouldMount && pill !== null) {
         removePill(pillRef);
       }
+      syncTransientUI(transientRef.current);
     }, 1200);
     return () => window.clearInterval(id);
   }, []);
   return null;
+}
+function tempRowRegion() {
+  const rows = Array.from(
+    document.querySelectorAll('div[role="treeitem"][class*="projectRow"]')
+  );
+  const out = [];
+  for (const row of rows) {
+    const title = row.querySelector('span[class*="projectText"]');
+    const text = title?.textContent ?? "";
+    if (!isTempTitle(text.trim())) continue;
+    const el = row;
+    out.push(el);
+    const parent = el.parentElement;
+    if (parent === null) continue;
+    const kids = Array.from(parent.children);
+    const index = kids.indexOf(el);
+    for (let i = index + 1; i < kids.length; i += 1) {
+      const sibling = kids[i];
+      if (sibling.matches('div[role="treeitem"][class*="projectRow"]')) break;
+      if (sibling.matches('div[role="treeitem"][class*="sessionRow"]')) out.push(sibling);
+    }
+  }
+  return out;
+}
+function syncTransientUI(active) {
+  const region = tempRowRegion();
+  if (!active) {
+    for (const el of region) {
+      delete el.style.display;
+      delete el.dataset.tempcwdHidden;
+    }
+    for (const el of document.querySelectorAll("[data-tempcwd-hidden]")) {
+      const node = el;
+      delete node.style.display;
+      delete node.dataset.tempcwdHidden;
+    }
+    for (const el of document.querySelectorAll("[data-tempcwd-freeze]")) {
+      const chip2 = el;
+      delete chip2.style.pointerEvents;
+      if (chip2.__tempCwdGuard !== void 0) {
+        chip2.removeEventListener("click", chip2.__tempCwdGuard, true);
+        chip2.__tempCwdGuard = void 0;
+      }
+      delete chip2.dataset.tempcwdFreeze;
+    }
+    return;
+  }
+  const hero = findHeroRow();
+  const chip = hero === null ? null : hero.querySelector("button");
+  if (chip !== null && !chip.dataset.tempcwdFreeze) {
+    const el = chip;
+    el.dataset.tempcwdFreeze = "1";
+    el.style.pointerEvents = "none";
+    const guard = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    el.__tempCwdGuard = guard;
+    el.addEventListener("click", guard, true);
+  }
+  for (const el of region) {
+    el.dataset.tempcwdHidden = "1";
+    el.style.display = "none";
+  }
 }
 function ensurePillStyle() {
   if (typeof document === "undefined") return;
@@ -284,6 +424,8 @@ function mountPill(row, onStart) {
   else row.appendChild(btn);
   return btn;
 }
+var EMPTY_ITEMS = [];
+var EMPTY_BY_ID = {};
 var PLUS_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>';
 
 		return module.exports;

@@ -1,5 +1,5 @@
 /**
- * dsh-temp-cwd — browser half (v12).
+ * dsh-temp-cwd — browser half (v13.2).
  *
  * Placement (user-confirmed): the 「开始临时对话」 pill stays inside the
  * official hero chip row (`heroWorkspaceRow`), because that row has no
@@ -11,28 +11,34 @@
  * Store consumption is official: the headless host component (registered on
  * the `sidebar.footer.action` LIST seat, renders nothing) reads the models
  * through the renderer-bound selector props `useWorkspaceList` /
- * `useSessionList`, which come from the inject `hooks` compartment
+ * `useSessionList` from the inject `hooks` compartment
  * (`workspaceList: ctx.workspaces.list`, `sessionList: ctx.sessions.list`).
- * Services (controllers) never cross into React — actions stay in `apply`.
- * v10 crashed with `workspaces.getSnapshot is not a function` because it
- * called subscribe/getSnapshot on the controller instead of the model.
+ * NOTE (0.1.2-alpha.1): ctx.sessions.list projects { ids, byId, current,
+ * phase, … } — there is NO `items` array; session entries live in `byId`
+ * keyed by session id (fields id/blank/running/title).
  *
- * Temp-folder lifecycle (v12, marker-based):
+ * Temp-folder lifecycle (v12+, marker-based): host mkdir scaffolds
+ * <root>/<timestamp> with a `.TEMP_WORKSPACE` marker; first message removes
+ * the marker and keeps the folder; abandoning before the first message
+ * removes the whole folder.
  *
- *   1. Click pill → host `mkdir` creates <root>/<timestamp> AND writes a
- *      `.TEMP_WORKSPACE` marker inside it.
- *   2. Adopt the folder as a real workspace (`workspaces.create({ path })`),
- *      create + open a session attached to it — the composer renders 100%
- *      native. `tempPending` remembers { workspaceId, path }.
- *   3. First message sent (blank → false): the session is real now. The
- *      plugin removes the marker (host remove-marker) and deletes the
- *      workspace — the session falls into 「未分组」 and the folder is kept.
- *   4. Abandoned before the first message (switch away, un-argued
- *      "new session" clears it, or plugin dispose): the folder still carries
- *      the marker, so the host removes the WHOLE directory (remove-dir) —
- *      empty temp dirs can no longer accumulate. Workspaces.delete removes
- *      the sidebar entry; files/folders created inside before that point are
- *      discarded too (marker = "abandoned scaffold, safe to remove entirely").
+ * Transient UI (v13+, user requirements):
+ *  - The adopted workspace is renamed to 「临时会话」 (+ numeric suffix on
+ *    name conflict) so the official hero chip shows that label.
+ *  - While the temp session is still blank the hero chip is frozen
+ *    (capture-phase click guard + pointer-events none) — the workspace
+ *    picker cannot open.
+ *  - The temp workspace row and its blank child sessions are hidden from the
+ *    sidebar tree. Only after the first message does the real conversation
+ *    surface — the workspace is deleted and the session appears under
+ *    「未分组」.
+ *  - Reload / re-open resilience: an already-existing temp workspace whose
+ *    blank session is current is re-adopted (tempPending + armCleanup) so
+ *    first-message finalization still works; temp workspaces with NO session
+ *    left behind by interrupted runs are swept (folder + workspace).
+ *  - All transient DOM state is idempotent and re-applied by the 1.2 s
+ *    self-heal tick, so React re-renders cannot strand a frozen chip or a
+ *    hidden row.
  */
 
 import * as React from 'react'
@@ -45,10 +51,16 @@ export const inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace']
 
 /**
  * The pending temp workspace (created, not yet finalized by first message or
- * by abandon cleanup). Cleared when cleanup fires; the dispose hook uses it
- * as a safety net (app closing while a temp session is still blank).
+ * by abandon cleanup). Cleared when cleanup fires; the dispose hook and the
+ * reload re-adoption logic use it as a safety net.
  */
 let tempPending: { workspaceId: string; path: string } | null = null
+
+/** Workspace ids already swept this session (store churn must not double-fire). */
+const sweptOrphans = new Set<string>()
+
+/** Display title prefix while a temp workspace is still blank. */
+const TEMP_WS_TITLE = '临时会话'
 
 /** The official hero chip row carries this CSS-module suffix (hash-prefixed). */
 const HERO_ROW_SELECTOR = '[class*="heroWorkspaceRow"]'
@@ -58,6 +70,11 @@ const PILL_CSS_ID = '@yezack/dsh-temp-cwd/pill.css'
 
 /** Pill tooltip (also restored after an error revert). */
 const PILL_TITLE = '创建临时工作区并直接开始对话（发送首条消息后自动归入未分组）'
+
+/** True when a workspace title belongs to a transient temp workspace. */
+function isTempTitle(title: unknown): boolean {
+  return typeof title === 'string' && title.startsWith(TEMP_WS_TITLE)
+}
 
 export function apply(ctx: any): void {
   const workspaces = ctx.workspaces
@@ -96,7 +113,7 @@ export function apply(ctx: any): void {
   // Headless host on the official sidebar.footer.action LIST seat (renders
   // nothing visible). Entry-owned `inject` projects the two bare models as
   // hook sources (renderer binds useWorkspaceList / useSessionList) plus the
-  // temp-session action kept in the apply closure.
+  // temp-session actions kept in the apply closure.
   ctx.slots.inject('sidebar.footer.action', () =>
     ctx.slots.register(
       {
@@ -106,15 +123,49 @@ export function apply(ctx: any): void {
           hooks: {
             /** Workspace model: subscribe/getSnapshot → { items, phase, … }. */
             workspaceList: workspaces.list,
-            /** Session list model: subscribe/getSnapshot → { items, current, … }. */
+            /** Session list model: subscribe/getSnapshot → { byId, current, … }. */
             sessionList: sessions.list,
           },
           onStartTemp: () => createTempSession(sessions, workspaces),
+          /** Re-arm cleanup for a temp workspace resumed after a reload. */
+          onResumeArmCleanup: (workspaceId: string, path: string, sessionId: string) => {
+            armCleanup(sessions, workspaces, workspaceId, path, sessionId)
+          },
+          /** Sweep a leftover temp workspace that has no sessions at all. */
+          onForgetOrphan: (workspaceId: string, path: string) => {
+            hostRemoveDir(path)
+            workspaces.delete(workspaceId).catch((err: any) => {
+              console.warn('[temp-cwd] orphan workspace delete failed:', err)
+            })
+          },
         }),
       },
       TempCwdHost,
     ),
   )
+}
+
+/**
+ * Rename the adopted workspace to the transient title, appending a numeric
+ * suffix while a stale temp workspace of the same name still exists (host
+ * enforces unique workspace names). Best-effort: failures just warn.
+ */
+async function renameTempWorkspace(workspaces: any, workspaceId: string): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const title = attempt === 0 ? TEMP_WS_TITLE : `${TEMP_WS_TITLE} ${attempt + 1}`
+    try {
+      await workspaces.rename(workspaceId, title)
+      return
+    } catch (err: any) {
+      const conflict = String(err?.message ?? err).includes('workspace-name-conflict')
+      if (!conflict) {
+        console.warn('[temp-cwd] rename to 临时会话 failed:', err)
+        return
+      }
+      // Name taken — try the next suffix.
+    }
+  }
+  console.warn('[temp-cwd] rename to 临时会话 failed: too many name conflicts')
 }
 
 /**
@@ -127,7 +178,10 @@ async function createTempSession(sessions: any, workspaces: any): Promise<void> 
   if (!res.ok) throw new Error(`mkdir failed: ${res.status}`)
   const { path } = (await res.json()) as { path: string }
 
-  // 2. Adopt it as a real workspace — the composer renders natively from now on.
+  // 2. Adopt it as a real workspace — the composer renders natively from now
+  //    on. (Do NOT rename yet: an extra round-trip before the session exists
+  //    can let the host drop the session-less workspace, failing
+  //    sessions.create with workspace-not-found.)
   const workspace = await workspaces.create({ path })
   tempPending = { workspaceId: workspace.workspaceId, path }
 
@@ -135,10 +189,15 @@ async function createTempSession(sessions: any, workspaces: any): Promise<void> 
     // 3. Session attached to that workspace.
     const sessionId = await sessions.create({ workspaceId: workspace.workspaceId })
 
-    // 4. Open it — native InputBar / Lexical composer, chip shows a real title.
+    // 4. Open it — native InputBar / Lexical composer.
     await sessions.open(sessionId)
 
-    // 5. Deferred cleanup: first message finalizes the folder (marker →
+    // 5. Now (cosmetically) rename to the transient title so the official
+    //    hero chip reads 「临时会话」; the transient UI engages via the next
+    //    store update.
+    await renameTempWorkspace(workspaces, workspace.workspaceId)
+
+    // 6. Deferred cleanup: first message finalizes the folder (marker →
     //    removed), abandoning it removes the whole folder (marker → delete).
     armCleanup(sessions, workspaces, workspace.workspaceId, path, sessionId)
   } catch (err) {
@@ -184,8 +243,8 @@ async function hostRemoveMarker(path: string): Promise<void> {
 /**
  * Subscribe to the session list model and finalize the temp workspace at the
  * first moment it is safe:
- *   - first message (`entry.blank === false`): real session — remove the
- *     marker (folder is kept) and delete the workspace (session → 未分组);
+ *   - first message (`byId[sessionId].blank === false`): real session —
+ *     remove the marker (folder is kept) and delete the workspace;
  *   - switch away / clear (`snap.current !== sessionId`): abandoned — remove
  *     the whole folder (marker authorizes it) and delete the workspace.
  */
@@ -200,13 +259,12 @@ function armCleanup(
   const dispose = sessions.list.subscribe(() => {
     if (done) return
     const snap = sessions.list.getSnapshot()
-    // The session-list store is seeded as { ids, byId, current, phase, … }
-    // and only gains `items` after the first projection; a transient reset
-    // (e.g. sessions.clear()) can notify with `items` undefined. Never read
-    // `.items` unguarded — a listener throw here would skip cleanup and leak
-    // the temp workspace.
-    const items = Array.isArray(snap?.items) ? snap.items : []
-    const entry = items.find((item: any) => item.sessionId === sessionId)
+    // ctx.sessions.list projects { ids, byId, current, phase, … } — entries
+    // live in `byId` keyed by session id; there is NO `items` array. Never
+    // assume the store is projected yet — a listener throw would skip
+    // cleanup and leak the temp workspace.
+    const byId = snap?.byId !== void 0 && snap.byId !== null ? snap.byId : {}
+    const entry = byId[sessionId]
     const firstMessage = entry !== undefined && entry.blank === false
     const abandoned = snap?.current !== sessionId
     if (!firstMessage && !abandoned) return
@@ -236,8 +294,8 @@ function armCleanup(
 /**
  * Headless host — renders nothing. Consumes the two models through the
  * renderer-bound selector hooks (`useWorkspaceList` / `useSessionList`) the
- * same way official slot components do, finds the official hero chip row,
- * and appends/removes the 「开始临时对话」 pill.
+ * same way official slot components do, then drives the pill AND the
+ * transient temp-session UI (frozen chip + hidden sidebar rows).
  */
 function TempCwdHost(props: {
   /** Renderer-bound selector hook over ctx.workspaces.list. */
@@ -246,34 +304,60 @@ function TempCwdHost(props: {
   useSessionList: <T>(selector: (snapshot: any) => T) => T
   /** Temp-session action (closure in apply). */
   onStartTemp: () => Promise<void>
+  /** Re-arm cleanup for a temp workspace resumed after a reload. */
+  onResumeArmCleanup: (workspaceId: string, path: string, sessionId: string) => void
+  /** Sweep a leftover temp workspace that has no sessions at all. */
+  onForgetOrphan: (workspaceId: string, path: string) => void
 }) {
-  const { useWorkspaceList, useSessionList, onStartTemp } = props
+  const { useWorkspaceList, useSessionList, onStartTemp, onResumeArmCleanup, onForgetOrphan } = props
 
   // Workspace items (reference-stable between invalidations) — each carries
   // `sessionIds`; the official ui-conversation / ui-workspace code resolves
   // a session's workspace exactly this way.
-  const wsItems = useWorkspaceList((snapshot) => snapshot.items)
+  const wsItems = useWorkspaceList((snapshot) =>
+    Array.isArray(snapshot?.items) ? snapshot.items : EMPTY_ITEMS,
+  )
   // Current session id (undefined while no session is selected).
   const currentSessionId = useSessionList((snapshot) => snapshot.current)
+  // Session registry: ctx.sessions.list projects { ids, byId, current, … }
+  // (NO `items` array); entries live in byId keyed by session id and carry
+  // id/blank/running/title. Stable fallback, never a fresh object per call.
+  const sessionById = useSessionList((snapshot) =>
+    snapshot?.byId !== void 0 && snapshot.byId !== null ? snapshot.byId : EMPTY_BY_ID,
+  )
 
-  const bound =
-    currentSessionId !== undefined &&
-    wsItems.some((w: any) => w.sessionIds.includes(currentSessionId))
+  const boundWs =
+    currentSessionId === undefined
+      ? undefined
+      : wsItems.find((w: any) => w.sessionIds.includes(currentSessionId))
+  const bound = boundWs !== undefined
+  const currentEntry =
+    currentSessionId === undefined ? undefined : sessionById[currentSessionId]
+  // Transient: bound to a temp workspace whose blank conversation has NOT
+  // started yet (first message flips blank → false and finalizes it).
+  const transient =
+    boundWs !== undefined &&
+    isTempTitle(boundWs.title) &&
+    currentEntry !== undefined &&
+    currentEntry.blank !== false
 
   const [row, setRow] = React.useState<HTMLElement | null>(null)
   const pillRef = React.useRef<HTMLButtonElement | null>(null)
   const rowRef = React.useRef<HTMLElement | null>(null)
   const boundRef = React.useRef<boolean>(false)
+  const transientRef = React.useRef<boolean>(false)
+  const resumedRef = React.useRef<boolean>(false)
 
   // Keep refs in sync so the interval tick can read current values.
   rowRef.current = row
   boundRef.current = bound
+  transientRef.current = transient
 
   // Store-driven rescan: session/workspace transitions remount/unmount the
   // hero row, so re-locate it every time the state we care about changes.
   React.useEffect(() => {
     setRow(findHeroRow())
-  }, [currentSessionId, bound])
+  }, [currentSessionId, bound, transient])
 
   // Mount effect: attach the pill to the current row (if any) whenever the
   // row element or the bound-state changes; remove it otherwise.
@@ -284,9 +368,57 @@ function TempCwdHost(props: {
     return () => removePill(pillRef)
   }, [row, bound, onStartTemp])
 
+  // Transient UI effect: freeze the chip + hide the sidebar rows while a temp
+  // session is still blank; restore everything as soon as it finalizes.
+  React.useEffect(() => {
+    syncTransientUI(transient)
+    return () => syncTransientUI(false)
+  }, [transient])
+
+  // Reload resilience: if a temp workspace with a still-blank session is
+  // current after (re)mount, re-arm cleanup so first-message finalization
+  // and abandon cleanup still run for it.
+  React.useEffect(() => {
+    if (resumedRef.current || currentSessionId === undefined) return
+    const resumed = wsItems.find(
+      (w: any) =>
+        isTempTitle(w.title) &&
+        Array.isArray(w.sessionIds) &&
+        w.sessionIds.includes(currentSessionId) &&
+        sessionById[currentSessionId] !== undefined,
+    )
+    if (resumed === undefined) return
+    const entry = sessionById[currentSessionId]
+    if (entry === undefined || entry.blank === false) return
+    const alreadyPending = tempPending !== null && tempPending.workspaceId === resumed.workspaceId
+    if (alreadyPending) return
+    resumedRef.current = true
+    tempPending = { workspaceId: resumed.workspaceId, path: resumed.path }
+    console.info('[temp-cwd] resumed blank temp session; re-arming cleanup', resumed.workspaceId)
+    onResumeArmCleanup(resumed.workspaceId, resumed.path, currentSessionId)
+  }, [wsItems, sessionById, currentSessionId, onResumeArmCleanup])
+
+  // Sweep: temp workspaces left behind by interrupted runs (no sessions at
+  // all) never show in the list and are removed on the next load. Never
+  // sweep while a temp workspace is being created (it has no session yet for
+  // a brief moment) and remember swept ids so store churn cannot double-fire.
+  React.useEffect(() => {
+    if (tempPending !== null) return
+    for (const w of wsItems) {
+      if (!isTempTitle(w.title)) continue
+      const sessionsInside = Array.isArray(w.sessionIds) ? w.sessionIds : []
+      if (sessionsInside.length > 0) continue
+      if (sweptOrphans.has(w.workspaceId)) continue
+      sweptOrphans.add(w.workspaceId)
+      console.info('[temp-cwd] sweeping session-less temp workspace', w.workspaceId)
+      onForgetOrphan(w.workspaceId, w.path)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wsItems])
+
   // Self-heal tick: catch row remounts that never touch the stores and any
-  // React reconciliation that disturbed the appended pill (re-append within
-  // ~1.2 s). Cheap: one querySelector when nothing changed.
+  // React reconciliation that disturbed the appended pill or the transient
+  // DOM state (re-apply within ~1.2 s).
   React.useEffect(() => {
     const id = window.setInterval(() => {
       const el = findHeroRow()
@@ -302,6 +434,9 @@ function TempCwdHost(props: {
       } else if (!shouldMount && pill !== null) {
         removePill(pillRef)
       }
+      // Re-assert transient DOM state idempotently (React may have swapped
+      // the chip button or the sidebar row nodes since the last tick).
+      syncTransientUI(transientRef.current)
     }, 1200)
     return () => window.clearInterval(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -309,6 +444,94 @@ function TempCwdHost(props: {
 
   // Headless: nothing visible from this seat.
   return null
+}
+
+/* ---- transient temp-session UI (frozen chip + hidden sidebar rows) ---- */
+
+/** The temp workspace's sidebar rows: its projectRow + following sessionRows. */
+function tempRowRegion(): HTMLElement[] {
+  const rows = Array.from(
+    document.querySelectorAll('div[role="treeitem"][class*="projectRow"]'),
+  )
+  const out: HTMLElement[] = []
+  for (const row of rows) {
+    const title = row.querySelector('span[class*="projectText"]')
+    const text = title?.textContent ?? ''
+    if (!isTempTitle(text.trim())) continue
+    const el = row as HTMLElement
+    out.push(el)
+    const parent = el.parentElement
+    if (parent === null) continue
+    const kids = Array.from(parent.children)
+    const index = kids.indexOf(el)
+    for (let i = index + 1; i < kids.length; i += 1) {
+      const sibling = kids[i] as HTMLElement
+      if (sibling.matches('div[role="treeitem"][class*="projectRow"]')) break
+      if (sibling.matches('div[role="treeitem"][class*="sessionRow"]')) out.push(sibling)
+    }
+  }
+  return out
+}
+
+/**
+ * Apply or remove the transient presentation:
+ *   - chip freeze: the official hero chip keeps its own React label (the
+ *     workspace is renamed to 「临时会话»), but pointer events are disabled
+ *     and a capture-phase click guard stops the workspace picker;
+ *   - sidebar: every temp workspace `projectRow` and its blank `sessionRow`s
+ *     are hidden while transient, and the SAME region is unhidden again when
+ *     the transient state ends (region-based, so even rows whose dataset
+ *     markers were lost to a React re-render get restored).
+ * Idempotent; safe to call on every tick.
+ */
+function syncTransientUI(active: boolean): void {
+  const region = tempRowRegion()
+
+  if (!active) {
+    // Un-hide the temp region rows (and any stragglers still tagged).
+    for (const el of region) {
+      delete el.style.display
+      delete el.dataset.tempcwdHidden
+    }
+    for (const el of document.querySelectorAll('[data-tempcwd-hidden]')) {
+      const node = el as HTMLElement
+      delete node.style.display
+      delete node.dataset.tempcwdHidden
+    }
+    for (const el of document.querySelectorAll('[data-tempcwd-freeze]')) {
+      const chip = el as HTMLElement
+      delete chip.style.pointerEvents
+      if (chip.__tempCwdGuard !== undefined) {
+        chip.removeEventListener('click', chip.__tempCwdGuard, true)
+        chip.__tempCwdGuard = undefined
+      }
+      delete chip.dataset.tempcwdFreeze
+    }
+    return
+  }
+
+  // Freeze the official hero workspace chip (first <button> in the hero row;
+  // the pill is not mounted while bound, so that IS the workspace chip).
+  const hero = findHeroRow()
+  const chip = hero === null ? null : hero.querySelector('button')
+  if (chip !== null && !(chip as HTMLElement).dataset.tempcwdFreeze) {
+    const el = chip as HTMLElement
+    el.dataset.tempcwdFreeze = '1'
+    el.style.pointerEvents = 'none'
+    const guard = (event: Event) => {
+      // Keep the official picker closed while the temp session is blank.
+      event.preventDefault()
+      event.stopPropagation()
+    }
+    el.__tempCwdGuard = guard
+    el.addEventListener('click', guard, true)
+  }
+
+  // Hide every temp workspace row + its blank child sessions.
+  for (const el of region) {
+    el.dataset.tempcwdHidden = '1'
+    el.style.display = 'none'
+  }
 }
 
 /* ---- pill DOM (imperative — deliberately no react-dom) ---- */
@@ -423,8 +646,21 @@ function mountPill(row: HTMLElement, onStart: () => Promise<void>): HTMLButtonEl
 
 /* ---- helpers ---- */
 
+/** Stable empty list shared by the workspace selector (never a fresh [] per call). */
+const EMPTY_ITEMS: any[] = []
+
+/** Stable empty registry shared by the session selector (never a fresh {} per call). */
+const EMPTY_BY_ID: Record<string, any> = {}
+
 /** 14px plus glyph (lucide-style), matching the host's stroke aesthetics. */
 const PLUS_SVG =
   '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
   '<path d="M5 12h14"/><path d="M12 5v14"/></svg>'
+
+// TS: annotate the ad-hoc capture-guard field used on the chip element.
+declare global {
+  interface HTMLElement {
+    __tempCwdGuard?: (event: Event) => void
+  }
+}

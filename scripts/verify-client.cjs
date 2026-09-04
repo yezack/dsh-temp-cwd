@@ -21,7 +21,7 @@ const checks = [
     /id:\s*["']temp-cwd["']/.test(code)],
   ['workspaces.create + delete', () => code.includes('workspaces.create({ path })') && /workspaces\.delete\(/.test(code)],
   ['sessions.create workspaceId', () => code.includes('sessions.create({ workspaceId: workspace.workspaceId })')],
-  ['blank-first-message cleanup (defensive items read)', () => code.includes('sessions.list.subscribe') && code.includes('entry.blank === false') && /snap\??\.current !== sessionId/.test(code) && code.includes('Array.isArray(snap')],
+  ['blank-first-message cleanup (byId registry read)', () => code.includes('sessions.list.subscribe') && code.includes('entry.blank === false') && /snap\??\.current !== sessionId/.test(code) && code.includes('byId[sessionId]')],
   ['startSession wrapper', () => code.includes('startSession = (workspaceId) => {') && code.includes('sessions.clear()')],
   ['no hero seat shadowing', () =>
     !/slots\.inject\(["']conversation\.hero/.test(code) &&
@@ -48,7 +48,21 @@ const checks = [
   ['first-message keeps folder / abandon removes folder', () =>
     code.includes('firstMessage') &&
     code.includes('abandoned') &&
-    code.includes('Array.isArray(snap')],
+    code.includes('byId[sessionId]')],
+  ['transient rename, conflict-safe (v13)', () =>
+    code.includes('TEMP_WS_TITLE') &&
+    code.includes('workspaces.rename(workspaceId, title)') &&
+    code.includes('workspace-name-conflict')],
+  ['transient UI freeze + sidebar hide (v13)', () =>
+    code.includes('syncTransientUI') &&
+    code.includes('tempcwdFreeze') &&
+    code.includes('tempcwdHidden') &&
+    code.includes('projectRow') &&
+    code.includes('sessionRow')],
+  ['reload resilience + orphan sweep (v13.2)', () =>
+    code.includes('onResumeArmCleanup') &&
+    code.includes('onForgetOrphan') &&
+    code.includes('tempRowRegion')],
   ['zero react-dom (pure-DOM pill)', () =>
     !code.includes('react-dom') &&
     !code.includes('createPortal')],
