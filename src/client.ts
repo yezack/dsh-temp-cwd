@@ -1,44 +1,29 @@
 /**
- * dsh-temp-cwd — browser half (v13.2).
+ * dsh-temp-cwd — browser half (v14, thin client / host-centric).
  *
- * Placement (user-confirmed): the 「开始临时对话」 pill stays inside the
- * official hero chip row (`heroWorkspaceRow`), because that row has no
- * injectable seat — both hero seats (`conversation.hero.workspace` /
- * `conversation.hero.agentPreset`) are single/root and occupied by official
- * packages, so a slot cell can never coexist there (v7/v8/v9 history). The
- * pill is one plain DOM `<button data-temp-cwd>` appended into the row.
+ * Since v14 ALL temp-session lifecycle decisions live in the host process
+ * (single authority, debounced, sweeped) — see src/index.ts. The browser
+ * half is deliberately thin:
  *
- * Store consumption is official: the headless host component (registered on
- * the `sidebar.footer.action` LIST seat, renders nothing) reads the models
- * through the renderer-bound selector props `useWorkspaceList` /
- * `useSessionList` from the inject `hooks` compartment
- * (`workspaceList: ctx.workspaces.list`, `sessionList: ctx.sessions.list`).
- * NOTE (0.1.2-alpha.1): ctx.sessions.list projects { ids, byId, current,
- * phase, … } — there is NO `items` array; session entries live in `byId`
- * keyed by session id (fields id/blank/running/title).
+ *   intents:   start → register → (finalize | abandon)  — plain host RPCs
+ *   display:   the 「开始临时对话」 pill in the hero chip row, the frozen
+ *              「临时会话」 chip while the blank temp session is open, and
+ *              hiding every temp workspace row + blank child session from the
+ *              sidebar tree. All display logic is idempotent and window-local,
+ *              so multiple UI windows cannot race each other through it.
  *
- * Temp-folder lifecycle (v12+, marker-based): host mkdir scaffolds
- * <root>/<timestamp> with a `.TEMP_WORKSPACE` marker; first message removes
- * the marker and keeps the folder; abandoning before the first message
- * removes the whole folder.
+ * The pill stays in `heroWorkspaceRow` (no injectable seat there — the two
+ * hero slots are single/root and occupied by official packages), appended as
+ * one plain DOM <button>. Store data is consumed through the official inject
+ * `hooks` compartment (workspaceList / sessionList → useWorkspaceList /
+ * useSessionList). ctx.sessions.list projects { ids, byId, current, phase,
+ * … } — there is NO `items` array; entries live in `byId`.
  *
- * Transient UI (v13+, user requirements):
- *  - The adopted workspace is renamed to 「临时会话」 (+ numeric suffix on
- *    name conflict) so the official hero chip shows that label.
- *  - While the temp session is still blank the hero chip is frozen
- *    (capture-phase click guard + pointer-events none) — the workspace
- *    picker cannot open.
- *  - The temp workspace row and its blank child sessions are hidden from the
- *    sidebar tree. Only after the first message does the real conversation
- *    surface — the workspace is deleted and the session appears under
- *    「未分组」.
- *  - Reload / re-open resilience: an already-existing temp workspace whose
- *    blank session is current is re-adopted (tempPending + armCleanup) so
- *    first-message finalization still works; temp workspaces with NO session
- *    left behind by interrupted runs are swept (folder + workspace).
- *  - All transient DOM state is idempotent and re-applied by the 1.2 s
- *    self-heal tick, so React re-renders cannot strand a frozen chip or a
- *    hidden row.
+ * Workspace/session CREATION still goes through the official client
+ * controllers (workspaces.create / sessions.create / sessions.open) so the
+ * local stores and the current selection stay consistent with the host; the
+ * host then registers the triple { path, workspaceId, sessionId } and owns
+ * the folder + workspace cleanup.
  */
 
 import * as React from 'react'
@@ -50,24 +35,18 @@ export const name = 'temp-cwd-client'
 export const inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace']
 
 /**
- * The pending temp workspace (created, not yet finalized by first message or
- * by abandon cleanup). Cleared when cleanup fires; the dispose hook and the
- * reload re-adoption logic use it as a safety net.
+ * This window's open temp session (path + sessionId). Used only to send the
+ * right host intents (finalize on first message, abandon on user clear /
+ * dispose). Host owns all cleanup.
  */
-let tempPending: { workspaceId: string; path: string } | null = null
+let tempPending: { path: string; sessionId: string } | null = null
 
 /**
  * True right after the USER asked for a fresh conversation (un-argued
- * startSession → our sessions.clear()). A clear that goes through our own
- * wrapper is an explicit abandon of the current blank temp session — the
- * abandon cleanup must run immediately and must NEVER auto-reopen it.
- * (Only a selection stolen by the host's "restore recent workspace" watcher
- * — which does NOT go through the wrapper — gets the grace + reopen path.)
+ * startSession → our sessions.clear()). That is an explicit abandon of the
+ * current blank temp session — send the host abandon intent immediately.
  */
 let userRequestedClear = false
-
-/** Workspace ids already swept this session (store churn must not double-fire). */
-const sweptOrphans = new Set<string>()
 
 /** Display title prefix while a temp workspace is still blank. */
 const TEMP_WS_TITLE = '临时会话'
@@ -92,34 +71,31 @@ export function apply(ctx: any): void {
   const uiWorkspace = ctx.uiWorkspace
 
   // Bug A: an un-argued "new session" must NEVER re-attach the current/recent
-  // workspace. The host's own startSession treats `target === void 0` by
-  // calling sessions.clear() — replicate that for un-argued calls, leave
-  // workspaceId-argued calls (explicit pick) untouched.
+  // workspace (it would hide the pill). Host's own startSession clears when
+  // target === undefined; replicate that. This is also the user's explicit
+  // abandon signal for a blank temp session → tell the host right away.
   const originalStartSession = uiWorkspace.startSession.bind(uiWorkspace)
   uiWorkspace.startSession = (workspaceId?: string) => {
     if (workspaceId === void 0) {
-      // Explicit user action (the new-session buttons). Any blank temp
-      // session currently open is thereby abandoned — remember that so the
-      // abandon cleanup finalizes immediately instead of auto-reopening it.
       userRequestedClear = true
       sessions.clear()
+      if (tempPending !== null) {
+        const pending = tempPending
+        tempPending = null
+        hostAbandon(pending.path, pending.sessionId)
+      }
       return
     }
     originalStartSession(workspaceId)
   }
 
-  // Safety net: if the plugin is disposed while a temp workspace is still
-  // pending (app closes before the first message), the folder is still an
-  // abandoned scaffold (marker present) → remove the whole directory, then
-  // delete the workspace. If the marker is already gone the host no-ops.
+  // Safety net: plugin disposed (app closing) with a pending blank temp
+  // session → the host abandons it (debounced, idempotent).
   ctx.on('dispose', () => {
     if (tempPending === null) return
     const pending = tempPending
     tempPending = null
-    hostRemoveDir(pending.path)
-    workspaces.delete(pending.workspaceId).catch((err: any) => {
-      console.error('[temp-cwd] dispose cleanup failed:', err)
-    })
+    hostAbandon(pending.path, pending.sessionId)
   })
 
   ensurePillStyle()
@@ -127,7 +103,7 @@ export function apply(ctx: any): void {
   // Headless host on the official sidebar.footer.action LIST seat (renders
   // nothing visible). Entry-owned `inject` projects the two bare models as
   // hook sources (renderer binds useWorkspaceList / useSessionList) plus the
-  // temp-session actions kept in the apply closure.
+  // temp-session action kept in the apply closure.
   ctx.slots.inject('sidebar.footer.action', () =>
     ctx.slots.register(
       {
@@ -141,16 +117,6 @@ export function apply(ctx: any): void {
             sessionList: sessions.list,
           },
           onStartTemp: () => createTempSession(sessions, workspaces),
-          /** Re-arm cleanup for a temp workspace resumed after a reload. */
-          onResumeArmCleanup: (workspaceId: string, path: string, sessionId: string) => {
-            armCleanup(sessions, workspaces, workspaceId, path, sessionId)
-          },
-          /**
-           * Purge one stale temp workspace: archive every remaining session
-           * (so no lonely rows can appear), remove the folder (marker), then
-           * delete the workspace.
-           */
-          onPurgeStale: (workspace: any) => purgeTempWorkspace(workspaces, workspace),
         }),
       },
       TempCwdHost,
@@ -158,10 +124,49 @@ export function apply(ctx: any): void {
   )
 }
 
+/* ---- host intents (thin RPC; the host does the work) ---- */
+
+async function hostStart(): Promise<string> {
+  const res = await fetch('/api/temp-cwd/start', { method: 'POST' })
+  if (!res.ok) throw new Error(`temp start failed: ${res.status}`)
+  const { path } = (await res.json()) as { path: string }
+  return path
+}
+
+async function hostRegister(path: string, workspaceId: string, sessionId: string): Promise<void> {
+  const res = await fetch(
+    `/api/temp-cwd/register?p=${encodeURIComponent(path)}&w=${encodeURIComponent(
+      workspaceId,
+    )}&s=${encodeURIComponent(sessionId)}`,
+    { method: 'POST' },
+  )
+  if (!res.ok) console.warn(`[temp-cwd] register failed (${res.status})`)
+}
+
+async function hostFinalize(path: string): Promise<void> {
+  try {
+    await fetch(`/api/temp-cwd/finalize?p=${encodeURIComponent(path)}`, { method: 'POST' })
+  } catch (err) {
+    console.warn('[temp-cwd] finalize request failed:', err)
+  }
+}
+
+async function hostAbandon(path: string, sessionId: string): Promise<void> {
+  try {
+    await fetch(
+      `/api/temp-cwd/abandon?p=${encodeURIComponent(path)}&s=${encodeURIComponent(sessionId)}`,
+      { method: 'POST' },
+    )
+  } catch (err) {
+    console.warn('[temp-cwd] abandon request failed:', err)
+  }
+}
+
+/* ---- create flow (client controllers for store sync + host register) ---- */
+
 /**
- * Rename the adopted workspace to the transient title, appending a numeric
- * suffix while a stale temp workspace of the same name still exists (host
- * enforces unique workspace names). Best-effort: failures just warn.
+ * Rename the adopted workspace to the transient title (display only),
+ * appending a numeric suffix on host name conflicts.
  */
 async function renameTempWorkspace(workspaces: any, workspaceId: string): Promise<void> {
   for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -170,296 +175,69 @@ async function renameTempWorkspace(workspaces: any, workspaceId: string): Promis
       await workspaces.rename(workspaceId, title)
       return
     } catch (err: any) {
-      const conflict = String(err?.message ?? err).includes('workspace-name-conflict')
-      if (!conflict) {
+      if (!String(err?.message ?? err).includes('workspace-name-conflict')) {
         console.warn('[temp-cwd] rename to 临时会话 failed:', err)
         return
       }
-      // Name taken — try the next suffix.
     }
   }
   console.warn('[temp-cwd] rename to 临时会话 failed: too many name conflicts')
 }
 
-/**
- * Create the temp workspace + session, open it, and arm the deferred cleanup.
- * The host mkdir route creates the folder AND the .TEMP_WORKSPACE marker.
- */
 async function createTempSession(sessions: any, workspaces: any): Promise<void> {
-  // A fresh temp session starts with a clean slate — a previous unrelated
-  // "new session" clear must not suppress the watcher-reopen path later.
   userRequestedClear = false
 
-  // 0. Clean up leftovers first: any stale 临时会话… workspace from an
-  //    interrupted run is fully purged (sessions archived, folder removed,
-  //    workspace deleted) BEFORE we scaffold a new one.
-  await purgeStaleBeforeCreate(sessions, workspaces)
+  // 1. Host scaffolds the folder + marker.
+  const path = await hostStart()
 
-  // 1. Ask the host for a fresh timestamped temp directory (+ marker).
-  const res = await fetch('/api/temp-cwd/mkdir', { method: 'POST' })
-  if (!res.ok) throw new Error(`mkdir failed: ${res.status}`)
-  const { path } = (await res.json()) as { path: string }
-
-  // 2. Adopt it as a real workspace — the composer renders natively from now
-  //    on. (Do NOT rename yet: an extra round-trip before the session exists
-  //    can let the host drop the session-less workspace, failing
-  //    sessions.create with workspace-not-found.)
+  // 2. Adopt it as a real workspace (official client controller keeps the
+  //    local store in sync). Do NOT rename yet — an extra round-trip before
+  //    the session exists can let the host drop the session-less workspace.
   const workspace = await workspaces.create({ path })
-  tempPending = { workspaceId: workspace.workspaceId, path }
 
   try {
-    // 3. Session attached to that workspace.
+    // 3. Session attached to that workspace, opened natively.
     const sessionId = await sessions.create({ workspaceId: workspace.workspaceId })
-
-    // 4. Open it — native InputBar / Lexical composer.
     await sessions.open(sessionId)
 
-    // 5. Now (cosmetically) rename to the transient title so the official
-    //    hero chip reads 「临时会话」; the transient UI engages via the next
-    //    store update.
+    // 4. Cosmetic rename so the official hero chip reads 「临时会话」.
     await renameTempWorkspace(workspaces, workspace.workspaceId)
 
-    // 6. Deferred cleanup: first message finalizes the folder (marker →
-    //    removed), abandoning it removes the whole folder (marker → delete).
-    armCleanup(sessions, workspaces, workspace.workspaceId, path, sessionId)
+    // 5. Hand the triple to the host — from here on the HOST owns cleanup.
+    tempPending = { path, sessionId }
+    await hostRegister(path, workspace.workspaceId, sessionId)
+
+    // 6. Watch only for the host-shared truth: first message → finalize.
+    watchFirstMessage(sessions, path, sessionId)
   } catch (err) {
-    // Session create/open failed — roll the abandoned scaffold back fully.
-    const pending = tempPending
-    tempPending = null
-    if (pending !== null) {
-      hostRemoveDir(pending.path)
-      workspaces.delete(pending.workspaceId).catch(() => {})
+    // Creation failed — tell the host to abandon the scaffold (idempotent).
+    if (tempPending !== null && tempPending.path === path) {
+      const pending = tempPending
+      tempPending = null
+      hostAbandon(pending.path, pending.sessionId)
+    } else {
+      hostAbandon(path, '')
     }
     throw err
   }
 }
 
-/**
- * Host calls (fire-and-forget; failures only log — never block the UI).
- */
-async function hostRemoveDir(path: string): Promise<void> {
-  try {
-    const res = await fetch(`/api/temp-cwd/remove-dir?p=${encodeURIComponent(path)}`, {
-      method: 'POST',
-    })
-    if (!res.ok) {
-      const body = (await res.json().catch(() => ({}))) as { reason?: string }
-      console.warn(`[temp-cwd] remove-dir refused (${res.status}):`, body.reason ?? res.status)
-    }
-  } catch (err) {
-    console.warn('[temp-cwd] remove-dir request failed:', err)
-  }
-}
-
-async function hostRemoveMarker(path: string): Promise<void> {
-  try {
-    const res = await fetch(`/api/temp-cwd/remove-marker?p=${encodeURIComponent(path)}`, {
-      method: 'POST',
-    })
-    if (!res.ok) console.warn(`[temp-cwd] remove-marker failed (${res.status})`)
-  } catch (err) {
-    console.warn('[temp-cwd] remove-marker request failed:', err)
-  }
-}
-
-/**
- * Read the temp marker's age from the host. A fresh marker means another
- * window may still be using this temp workspace — sweep/purge must only ever
- * touch markers older than {@link PURGE_AGE_MS}.
- */
-async function hostMarkerInfo(path: string): Promise<{ hasMarker: boolean; mtimeMs: number }> {
-  try {
-    const res = await fetch(`/api/temp-cwd/info?p=${encodeURIComponent(path)}`, {
-      method: 'POST',
-    })
-    if (!res.ok) return { hasMarker: false, mtimeMs: 0 }
-    return (await res.json()) as { hasMarker: boolean; mtimeMs: number }
-  } catch {
-    return { hasMarker: false, mtimeMs: 0 }
-  }
-}
-
-/** Markers younger than this are treated as possibly-live (other window). */
-const PURGE_AGE_MS = 20_000
-
-/**
- * Fully purge one stale temp workspace (leftover from an interrupted run):
- * archive every session it still holds (the host's "remove from the active
- * list" operation — otherwise the session would fall into 未分组 and show),
- * remove the temp folder (marker authorizes it), then delete the workspace.
- */
-async function purgeTempWorkspace(workspaces: any, workspace: any): Promise<void> {
-  const sessionIds = Array.isArray(workspace?.sessionIds) ? workspace.sessionIds : []
-  for (const sessionId of sessionIds) {
-    try {
-      await workspaces.archiveSession(sessionId)
-    } catch (err) {
-      console.warn('[temp-cwd] purge: archive session failed (ignored):', err)
-    }
-  }
-  await hostRemoveDir(workspace?.path)
-  try {
-    await workspaces.delete(workspace.workspaceId)
-    console.info('[temp-cwd] purged stale temp workspace', workspace.workspaceId)
-  } catch (err) {
-    if (!String(err?.message ?? err).includes('workspace-not-found')) {
-      console.warn('[temp-cwd] purge: workspace delete failed:', err)
-    }
-  }
-}
-
-/**
- * Before creating a NEW temp session, purge every stale temp workspace
- * (title 「临时会话…») that is not the current session's workspace — so the
- * user never accumulates leftover 临时会话 / 临时会话 2 rows, and the base
- * name is free again.
- */
-async function purgeStaleBeforeCreate(sessions: any, workspaces: any): Promise<void> {
-  const wsSnap = workspaces.list.getSnapshot()
-  const sesSnap = sessions.list.getSnapshot()
-  const items = Array.isArray(wsSnap?.items) ? wsSnap.items : []
-  const current = sesSnap?.current
-  const candidates = items.filter(
-    (w: any) =>
-      isTempTitle(w.title) &&
-      !(current !== undefined && Array.isArray(w.sessionIds) && w.sessionIds.includes(current)),
-  )
-  if (candidates.length === 0) return
-  console.info(
-    '[temp-cwd] checking stale temp workspace(s) before create:',
-    candidates.length,
-  )
-  for (const w of candidates) {
-    // Age gate: never purge a marker younger than PURGE_AGE_MS — another
-    // window may be actively using this temp workspace right now.
-    const info = await hostMarkerInfo(w.path)
-    const stale = info.hasMarker && Date.now() - info.mtimeMs >= PURGE_AGE_MS
-    if (!stale) continue
-    sweptOrphans.add(w.workspaceId)
-    console.info('[temp-cwd] purging stale temp workspace (marker age ok)', w.workspaceId)
-    await purgeTempWorkspace(workspaces, w)
-  }
-}
-
-/**
- * Subscribe to the session list model and finalize the temp workspace at the
- * first moment it is safe:
- *   - first message (`byId[sessionId].blank === false`): real session —
- *     remove the marker (folder is kept) and delete the workspace;
- *   - switch away / clear (`snap.current !== sessionId`): abandoned — remove
- *     the whole folder (marker authorizes it) and delete the workspace.
- */
-function armCleanup(
-  sessions: any,
-  workspaces: any,
-  workspaceId: string,
-  path: string,
-  sessionId: string,
-): void {
-  let done = false
-  let abandonCandidate = false
-  let abandonTimer = 0
-
-  const finalizeAbandon = () => {
-    if (done) return
-    done = true
-    dispose()
-    const pending = tempPending
-    if (pending !== null && pending.workspaceId === workspaceId) tempPending = null
-    // Abandoned BEFORE the first message: nothing of it may remain visible in
-    // the sidebar. Remove the whole temp folder (marker authorizes it),
-    // archive the still-blank session (workspace deletion alone would drop it
-    // into 未分组 and leave the "lonely temp conversation" row), then delete
-    // the workspace.
-    console.info('[temp-cwd] abandoned — removing folder + archiving session', path)
-    void hostRemoveDir(path)
-      .then(() => workspaces.archiveSession(sessionId))
-      .then(
-        () => {
-          console.info('[temp-cwd] archived session; deleting workspace', workspaceId)
-          return workspaces.delete(workspaceId)
-        },
-        (err: any) => {
-          console.warn('[temp-cwd] archive failed, deleting workspace anyway:', err)
-          return workspaces.delete(workspaceId)
-        },
-      )
-      .catch((err: any) => {
-        // workspace-not-found is expected: archiving the last session can
-        // make the host delete the now-empty workspace itself.
-        if (!String(err?.message ?? err).includes('workspace-not-found')) {
-          console.warn('[temp-cwd] abandon cleanup failed:', err)
-        }
-      })
-  }
-
+/** On the first message (blank → false), ask the host to finalize. */
+function watchFirstMessage(sessions: any, path: string, sessionId: string): void {
   const dispose = sessions.list.subscribe(() => {
-    if (done) return
     const snap = sessions.list.getSnapshot()
-    // ctx.sessions.list projects { ids, byId, current, phase, … } — entries
-    // live in `byId` keyed by session id; there is NO `items` array. Never
-    // assume the store is projected yet — a listener throw would skip
-    // cleanup and leak the temp workspace.
     const byId = snap?.byId !== void 0 && snap.byId !== null ? snap.byId : {}
     const entry = byId[sessionId]
-    const firstMessage = entry !== undefined && entry.blank === false
-    if (firstMessage) {
-      done = true
-      dispose()
-      window.clearTimeout(abandonTimer)
-      const pending = tempPending
-      if (pending !== null && pending.workspaceId === workspaceId) tempPending = null
-      // First message — the session is real: keep the folder (remove the
-      // marker) and delete the workspace; the session moves to 未分组.
-      console.info('[temp-cwd] first message — keeping folder, removing marker', path)
-      void hostRemoveMarker(path)
-        .then(() => {
-          console.info('[temp-cwd] marker removed; deleting workspace', workspaceId)
-          return workspaces.delete(workspaceId)
-        })
-        .catch((err: any) => {
-          console.warn('[temp-cwd] first-message cleanup failed:', err)
-        })
-      return
-    }
-
-    // Abandon candidate: the current session moved away. Give transient
-    // host-side selection churn (e.g. the startup "restore recent workspace"
-    // watcher) one short re-check — but NEVER auto-reopen the session. An
-    // explicit user "new session" click (our own clear) finalizes instantly.
-    const abandoned = snap?.current !== sessionId
-    if (!abandoned) {
-      abandonCandidate = false
-      window.clearTimeout(abandonTimer)
-      return
-    }
-    if (userRequestedClear) {
-      userRequestedClear = false
-      finalizeAbandon()
-      return
-    }
-    if (abandonCandidate) return
-    abandonCandidate = true
-    abandonTimer = window.setTimeout(() => {
-      if (done) return
-      const snap2 = sessions.list.getSnapshot()
-      const current2 = snap2?.current
-      if (current2 === sessionId) {
-        // Selection came back — still active.
-        abandonCandidate = false
-        return
-      }
-      finalizeAbandon()
-    }, 1200)
+    if (entry === undefined || entry.blank !== false) return
+    dispose()
+    if (tempPending !== null && tempPending.sessionId === sessionId) tempPending = null
+    console.info('[temp-cwd] first message — host finalize (keep folder)', path)
+    void hostFinalize(path)
   })
 }
 
-/**
- * Headless host — renders nothing. Consumes the two models through the
- * renderer-bound selector hooks (`useWorkspaceList` / `useSessionList`) the
- * same way official slot components do, then drives the pill AND the
- * transient temp-session UI (frozen chip + hidden sidebar rows).
- */
+/* ---- headless display host: pill + transient freeze/hide ---- */
+
 function TempCwdHost(props: {
   /** Renderer-bound selector hook over ctx.workspaces.list. */
   useWorkspaceList: <T>(selector: (snapshot: any) => T) => T
@@ -467,12 +245,8 @@ function TempCwdHost(props: {
   useSessionList: <T>(selector: (snapshot: any) => T) => T
   /** Temp-session action (closure in apply). */
   onStartTemp: () => Promise<void>
-  /** Re-arm cleanup for a temp workspace resumed after a reload. */
-  onResumeArmCleanup: (workspaceId: string, path: string, sessionId: string) => void
-  /** Purge one stale temp workspace (archive sessions, remove dir, delete). */
-  onPurgeStale: (workspace: any) => Promise<void>
 }) {
-  const { useWorkspaceList, useSessionList, onStartTemp, onResumeArmCleanup, onPurgeStale } = props
+  const { useWorkspaceList, useSessionList, onStartTemp } = props
 
   // Workspace items (reference-stable between invalidations) — each carries
   // `sessionIds`; the official ui-conversation / ui-workspace code resolves
@@ -509,7 +283,6 @@ function TempCwdHost(props: {
   const rowRef = React.useRef<HTMLElement | null>(null)
   const boundRef = React.useRef<boolean>(false)
   const transientRef = React.useRef<boolean>(false)
-  const resumedRef = React.useRef<boolean>(false)
 
   // Keep refs in sync so the interval tick can read current values.
   rowRef.current = row
@@ -532,70 +305,15 @@ function TempCwdHost(props: {
   }, [row, bound, onStartTemp])
 
   // Transient UI effect: freeze the chip + hide the sidebar rows while a temp
-  // session is still blank; restore everything as soon as it finalizes.
+  // session is still blank; restore the freeze when it ends. (Temp rows are
+  // hidden unconditionally — stale temp rows never resurface either.)
   React.useEffect(() => {
     syncTransientUI(transient)
     return () => syncTransientUI(false)
   }, [transient])
 
-  // Reload resilience: if a temp workspace with a still-blank session is
-  // current after (re)mount, re-arm cleanup so first-message finalization
-  // and abandon cleanup still run for it.
-  React.useEffect(() => {
-    if (resumedRef.current || currentSessionId === undefined) return
-    const resumed = wsItems.find(
-      (w: any) =>
-        isTempTitle(w.title) &&
-        Array.isArray(w.sessionIds) &&
-        w.sessionIds.includes(currentSessionId) &&
-        sessionById[currentSessionId] !== undefined,
-    )
-    if (resumed === undefined) return
-    const entry = sessionById[currentSessionId]
-    if (entry === undefined || entry.blank === false) return
-    const alreadyPending = tempPending !== null && tempPending.workspaceId === resumed.workspaceId
-    if (alreadyPending) return
-    resumedRef.current = true
-    tempPending = { workspaceId: resumed.workspaceId, path: resumed.path }
-    console.info('[temp-cwd] resumed blank temp session; re-arming cleanup', resumed.workspaceId)
-    onResumeArmCleanup(resumed.workspaceId, resumed.path, currentSessionId)
-  }, [wsItems, sessionById, currentSessionId, onResumeArmCleanup])
-
-  // Purge: temp workspaces left behind by interrupted runs (anything not
-  // currently open) are removed on the next load — but ONLY once their marker
-  // is older than PURGE_AGE_MS, so a fresh temp workspace still in use by
-  // another window is never touched. Remember checked ids so store churn
-  // cannot double-fire.
-  React.useEffect(() => {
-    if (tempPending !== null) return
-    const candidates = wsItems.filter((w: any) => {
-      if (!isTempTitle(w.title)) return false
-      const sessionsInside = Array.isArray(w.sessionIds) ? w.sessionIds : []
-      if (
-        currentSessionId !== undefined &&
-        sessionsInside.includes(currentSessionId)
-      ) {
-        return false
-      }
-      return !sweptOrphans.has(w.workspaceId)
-    })
-    if (candidates.length === 0) return
-    void (async () => {
-      for (const w of candidates) {
-        const info = await hostMarkerInfo(w.path)
-        const stale = info.hasMarker && Date.now() - info.mtimeMs >= PURGE_AGE_MS
-        if (!stale) continue
-        sweptOrphans.add(w.workspaceId)
-        console.info('[temp-cwd] purging stale temp workspace on load (marker age ok)', w.workspaceId)
-        await onPurgeStale(w)
-      }
-    })()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsItems])
-
-  // Self-heal tick: catch row remounts that never touch the stores and any
-  // React reconciliation that disturbed the appended pill or the transient
-  // DOM state (re-apply within ~1.2 s).
+  // Self-heal tick: catch row remounts and React reconciliation that
+  // disturbed the appended pill or the transient DOM state (re-apply ~1.2 s).
   React.useEffect(() => {
     const id = window.setInterval(() => {
       const el = findHeroRow()
@@ -611,8 +329,6 @@ function TempCwdHost(props: {
       } else if (!shouldMount && pill !== null) {
         removePill(pillRef)
       }
-      // Re-assert transient DOM state idempotently (React may have swapped
-      // the chip button or the sidebar row nodes since the last tick).
       syncTransientUI(transientRef.current)
     }, 1200)
     return () => window.clearInterval(id)
@@ -623,19 +339,14 @@ function TempCwdHost(props: {
   return null
 }
 
-/* ---- transient temp-session UI (frozen chip + hidden sidebar rows) ---- */
+/* ---- transient display (frozen chip + hidden sidebar rows) ---- */
 
 /**
  * The temp workspace's sidebar rows, returned as the actual hide units.
- *
- * DOM shape (observed): each visible row is a `div[role=treeitem]` wrapped in
- * a SPAN (`_root_…`), and one group section (`.groupSection`) contains the
- * wrapper of the workspace row followed by the wrappers of its session rows.
- * Hiding the bare row div is not enough — the wrapper span stays and the
- * session rows (e.g. the SELECTED blank `…sessionRow …selected` 「新会话」)
- * remain visible next to it. So this returns the WRAPPERS: the temp
- * workspace row's wrapper plus every following wrapper in the same section
- * that contains a session row (stop at the next workspace row wrapper).
+ * DOM shape: each row div[role=treeitem] is wrapped in a SPAN (`_root_…`),
+ * and one group section (`.groupSection`) holds the wrappers of a workspace
+ * row followed by its session rows. Hiding the bare row div is not enough —
+ * hide the WRAPPERS (temp workspace row + following session-row wrappers).
  */
 function tempRowRegion(): HTMLElement[] {
   const rows = Array.from(
@@ -650,7 +361,6 @@ function tempRowRegion(): HTMLElement[] {
     const el = row as HTMLElement
     const wrapper = el.parentElement as HTMLElement | null
     if (wrapper === null) {
-      // No wrapper (unexpected layout) — hide the row itself as a fallback.
       out.push(el)
       continue
     }
@@ -661,13 +371,8 @@ function tempRowRegion(): HTMLElement[] {
     const index = kids.indexOf(wrapper)
     for (let i = index + 1; i < kids.length; i += 1) {
       const sibling = kids[i] as HTMLElement
-      const inside = sibling.querySelector(
-        'div[role="treeitem"][class*="projectRow"]',
-      )
-      if (inside !== null) break
-      if (
-        sibling.querySelector('div[role="treeitem"][class*="sessionRow"]') !== null
-      ) {
+      if (sibling.querySelector('div[role="treeitem"][class*="projectRow"]') !== null) break
+      if (sibling.querySelector('div[role="treeitem"][class*="sessionRow"]') !== null) {
         out.push(sibling)
       }
     }
@@ -675,24 +380,11 @@ function tempRowRegion(): HTMLElement[] {
   return out
 }
 
-/**
- * Apply or remove the transient presentation:
- *   - chip freeze: the official hero chip keeps its own React label (the
- *     workspace is renamed to 「临时会话»), but pointer events are disabled
- *     and a capture-phase click guard stops the workspace picker;
- *   - sidebar: every temp workspace `projectRow` and its blank `sessionRow`s
- *     are hidden while transient, and the SAME region is unhidden again when
- *     the transient state ends (region-based, so even rows whose dataset
- *     markers were lost to a React re-render get restored).
- * Idempotent; safe to call on every tick.
- */
 function syncTransientUI(active: boolean): void {
   const region = tempRowRegion()
 
   if (!active) {
-    // Chip freeze is transient-only: restore it once the blank temp session
-    // ends. Temp workspace ROWS are hidden unconditionally (any temp-titled
-    // workspace row must never surface in the list, not even stale ones).
+    // Chip freeze is transient-only. Temp ROWS are hidden unconditionally.
     for (const el of document.querySelectorAll('[data-tempcwd-freeze]')) {
       const chip = el as HTMLElement
       delete chip.style.pointerEvents
@@ -703,9 +395,6 @@ function syncTransientUI(active: boolean): void {
       delete chip.dataset.tempcwdFreeze
     }
   } else {
-    // Freeze the official hero workspace chip (first <button> in the hero
-    // row; the pill is not mounted while bound, so that IS the workspace
-    // chip).
     const hero = findHeroRow()
     const chip = hero === null ? null : hero.querySelector('button')
     if (chip !== null && !(chip as HTMLElement).dataset.tempcwdFreeze) {
@@ -713,7 +402,6 @@ function syncTransientUI(active: boolean): void {
       el.dataset.tempcwdFreeze = '1'
       el.style.pointerEvents = 'none'
       const guard = (event: Event) => {
-        // Keep the official picker closed while the temp session is blank.
         event.preventDefault()
         event.stopPropagation()
       }
@@ -722,8 +410,6 @@ function syncTransientUI(active: boolean): void {
     }
   }
 
-  // Hide every temp workspace row + its blank child sessions. Runs on every
-  // tick regardless of `active` so stale temp rows never resurface either.
   for (const el of region) {
     el.dataset.tempcwdHidden = '1'
     el.style.display = 'none'
@@ -739,8 +425,6 @@ function ensurePillStyle(): void {
   const tag = document.createElement('style')
   tag.dataset.pluginCss = PILL_CSS_ID
   tag.textContent = [
-    // Exact chip look: same tokens as the official `…_workspace` chip
-    // (radius 16, min-height 28, 13px/500, label-primary, hover bg).
     'button[data-temp-cwd]{display:inline-flex;align-items:center;gap:4px;min-height:28px;max-width:min(100%,360px);box-sizing:border-box;border-radius:16px;padding:0 8px;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;font-weight:500;line-height:20px;cursor:pointer}',
     'button[data-temp-cwd]:hover{background:var(--dsw-alias-interactive-bg-hover)}',
     'button[data-temp-cwd][data-temp-cwd-state="busy"]{opacity:.65;cursor:wait}',
@@ -766,12 +450,7 @@ function removePill(pillRef: React.MutableRefObject<HTMLButtonElement | null>): 
   if (pill !== null && pill.isConnected) pill.remove()
 }
 
-/**
- * Append the 「开始临时对话」 pill to the official hero chip row and wire its
- * click to the temp-session flow. Returns the button (caller keeps it in a
- * ref for removal / self-heal). Busy/error feedback is imperative DOM text
- * updates — no react-dom, no re-render loop.
- */
+/** Append the pill right after the official 「选择工作区」 chip and wire it. */
 function mountPill(row: HTMLElement, onStart: () => Promise<void>): HTMLButtonElement {
   const btn = document.createElement('button')
   btn.type = 'button'
@@ -822,18 +501,12 @@ function mountPill(row: HTMLElement, onStart: () => Promise<void>): HTMLButtonEl
       })
       .finally(() => {
         busy = false
-        // Success normally unmounts the row (session becomes active); only
-        // revert to idle if the pill is still around (e.g. still settling).
         if (btn.isConnected && btn.getAttribute('data-temp-cwd-state') !== 'idle') {
           setIdle()
         }
       })
   })
 
-  // Insert the pill immediately after the official 「选择工作区」 chip (first
-  // <button> in the row) — the row may also contain a mode/agent-preset chip
-  // (e.g. 「CTF解题模式」), so a plain append or flex `order` cannot guarantee
-  // the pill's position. Fall back to appending when no chip is found.
   const chip = row.querySelector('button')
   if (chip !== null) chip.after(btn)
   else row.appendChild(btn)

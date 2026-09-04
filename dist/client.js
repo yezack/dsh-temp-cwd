@@ -44,7 +44,6 @@ var name = "temp-cwd-client";
 var inject = ["slots", "sessions", "workspaces", "uiWorkspace"];
 var tempPending = null;
 var userRequestedClear = false;
-var sweptOrphans = /* @__PURE__ */ new Set();
 var TEMP_WS_TITLE = "临时会话";
 var HERO_ROW_SELECTOR = '[class*="heroWorkspaceRow"]';
 var PILL_CSS_ID = "@yezack/dsh-temp-cwd/pill.css";
@@ -61,6 +60,11 @@ function apply(ctx) {
     if (workspaceId === void 0) {
       userRequestedClear = true;
       sessions.clear();
+      if (tempPending !== null) {
+        const pending = tempPending;
+        tempPending = null;
+        hostAbandon(pending.path, pending.sessionId);
+      }
       return;
     }
     originalStartSession(workspaceId);
@@ -69,10 +73,7 @@ function apply(ctx) {
     if (tempPending === null) return;
     const pending = tempPending;
     tempPending = null;
-    hostRemoveDir(pending.path);
-    workspaces.delete(pending.workspaceId).catch((err) => {
-      console.error("[temp-cwd] dispose cleanup failed:", err);
-    });
+    hostAbandon(pending.path, pending.sessionId);
   });
   ensurePillStyle();
   ctx.slots.inject(
@@ -88,22 +89,44 @@ function apply(ctx) {
             /** Session list model: subscribe/getSnapshot → { byId, current, … }. */
             sessionList: sessions.list
           },
-          onStartTemp: () => createTempSession(sessions, workspaces),
-          /** Re-arm cleanup for a temp workspace resumed after a reload. */
-          onResumeArmCleanup: (workspaceId, path, sessionId) => {
-            armCleanup(sessions, workspaces, workspaceId, path, sessionId);
-          },
-          /**
-           * Purge one stale temp workspace: archive every remaining session
-           * (so no lonely rows can appear), remove the folder (marker), then
-           * delete the workspace.
-           */
-          onPurgeStale: (workspace) => purgeTempWorkspace(workspaces, workspace)
+          onStartTemp: () => createTempSession(sessions, workspaces)
         })
       },
       TempCwdHost
     )
   );
+}
+async function hostStart() {
+  const res = await fetch("/api/temp-cwd/start", { method: "POST" });
+  if (!res.ok) throw new Error(`temp start failed: ${res.status}`);
+  const { path } = await res.json();
+  return path;
+}
+async function hostRegister(path, workspaceId, sessionId) {
+  const res = await fetch(
+    `/api/temp-cwd/register?p=${encodeURIComponent(path)}&w=${encodeURIComponent(
+      workspaceId
+    )}&s=${encodeURIComponent(sessionId)}`,
+    { method: "POST" }
+  );
+  if (!res.ok) console.warn(`[temp-cwd] register failed (${res.status})`);
+}
+async function hostFinalize(path) {
+  try {
+    await fetch(`/api/temp-cwd/finalize?p=${encodeURIComponent(path)}`, { method: "POST" });
+  } catch (err) {
+    console.warn("[temp-cwd] finalize request failed:", err);
+  }
+}
+async function hostAbandon(path, sessionId) {
+  try {
+    await fetch(
+      `/api/temp-cwd/abandon?p=${encodeURIComponent(path)}&s=${encodeURIComponent(sessionId)}`,
+      { method: "POST" }
+    );
+  } catch (err) {
+    console.warn("[temp-cwd] abandon request failed:", err);
+  }
 }
 async function renameTempWorkspace(workspaces, workspaceId) {
   for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -112,8 +135,7 @@ async function renameTempWorkspace(workspaces, workspaceId) {
       await workspaces.rename(workspaceId, title);
       return;
     } catch (err) {
-      const conflict = String(err?.message ?? err).includes("workspace-name-conflict");
-      if (!conflict) {
+      if (!String(err?.message ?? err).includes("workspace-name-conflict")) {
         console.warn("[temp-cwd] rename to 临时会话 failed:", err);
         return;
       }
@@ -123,178 +145,40 @@ async function renameTempWorkspace(workspaces, workspaceId) {
 }
 async function createTempSession(sessions, workspaces) {
   userRequestedClear = false;
-  await purgeStaleBeforeCreate(sessions, workspaces);
-  const res = await fetch("/api/temp-cwd/mkdir", { method: "POST" });
-  if (!res.ok) throw new Error(`mkdir failed: ${res.status}`);
-  const { path } = await res.json();
+  const path = await hostStart();
   const workspace = await workspaces.create({ path });
-  tempPending = { workspaceId: workspace.workspaceId, path };
   try {
     const sessionId = await sessions.create({ workspaceId: workspace.workspaceId });
     await sessions.open(sessionId);
     await renameTempWorkspace(workspaces, workspace.workspaceId);
-    armCleanup(sessions, workspaces, workspace.workspaceId, path, sessionId);
+    tempPending = { path, sessionId };
+    await hostRegister(path, workspace.workspaceId, sessionId);
+    watchFirstMessage(sessions, path, sessionId);
   } catch (err) {
-    const pending = tempPending;
-    tempPending = null;
-    if (pending !== null) {
-      hostRemoveDir(pending.path);
-      workspaces.delete(pending.workspaceId).catch(() => {
-      });
+    if (tempPending !== null && tempPending.path === path) {
+      const pending = tempPending;
+      tempPending = null;
+      hostAbandon(pending.path, pending.sessionId);
+    } else {
+      hostAbandon(path, "");
     }
     throw err;
   }
 }
-async function hostRemoveDir(path) {
-  try {
-    const res = await fetch(`/api/temp-cwd/remove-dir?p=${encodeURIComponent(path)}`, {
-      method: "POST"
-    });
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      console.warn(`[temp-cwd] remove-dir refused (${res.status}):`, body.reason ?? res.status);
-    }
-  } catch (err) {
-    console.warn("[temp-cwd] remove-dir request failed:", err);
-  }
-}
-async function hostRemoveMarker(path) {
-  try {
-    const res = await fetch(`/api/temp-cwd/remove-marker?p=${encodeURIComponent(path)}`, {
-      method: "POST"
-    });
-    if (!res.ok) console.warn(`[temp-cwd] remove-marker failed (${res.status})`);
-  } catch (err) {
-    console.warn("[temp-cwd] remove-marker request failed:", err);
-  }
-}
-async function hostMarkerInfo(path) {
-  try {
-    const res = await fetch(`/api/temp-cwd/info?p=${encodeURIComponent(path)}`, {
-      method: "POST"
-    });
-    if (!res.ok) return { hasMarker: false, mtimeMs: 0 };
-    return await res.json();
-  } catch {
-    return { hasMarker: false, mtimeMs: 0 };
-  }
-}
-var PURGE_AGE_MS = 2e4;
-async function purgeTempWorkspace(workspaces, workspace) {
-  const sessionIds = Array.isArray(workspace?.sessionIds) ? workspace.sessionIds : [];
-  for (const sessionId of sessionIds) {
-    try {
-      await workspaces.archiveSession(sessionId);
-    } catch (err) {
-      console.warn("[temp-cwd] purge: archive session failed (ignored):", err);
-    }
-  }
-  await hostRemoveDir(workspace?.path);
-  try {
-    await workspaces.delete(workspace.workspaceId);
-    console.info("[temp-cwd] purged stale temp workspace", workspace.workspaceId);
-  } catch (err) {
-    if (!String(err?.message ?? err).includes("workspace-not-found")) {
-      console.warn("[temp-cwd] purge: workspace delete failed:", err);
-    }
-  }
-}
-async function purgeStaleBeforeCreate(sessions, workspaces) {
-  const wsSnap = workspaces.list.getSnapshot();
-  const sesSnap = sessions.list.getSnapshot();
-  const items = Array.isArray(wsSnap?.items) ? wsSnap.items : [];
-  const current = sesSnap?.current;
-  const candidates = items.filter(
-    (w) => isTempTitle(w.title) && !(current !== void 0 && Array.isArray(w.sessionIds) && w.sessionIds.includes(current))
-  );
-  if (candidates.length === 0) return;
-  console.info(
-    "[temp-cwd] checking stale temp workspace(s) before create:",
-    candidates.length
-  );
-  for (const w of candidates) {
-    const info = await hostMarkerInfo(w.path);
-    const stale = info.hasMarker && Date.now() - info.mtimeMs >= PURGE_AGE_MS;
-    if (!stale) continue;
-    sweptOrphans.add(w.workspaceId);
-    console.info("[temp-cwd] purging stale temp workspace (marker age ok)", w.workspaceId);
-    await purgeTempWorkspace(workspaces, w);
-  }
-}
-function armCleanup(sessions, workspaces, workspaceId, path, sessionId) {
-  let done = false;
-  let abandonCandidate = false;
-  let abandonTimer = 0;
-  const finalizeAbandon = () => {
-    if (done) return;
-    done = true;
-    dispose();
-    const pending = tempPending;
-    if (pending !== null && pending.workspaceId === workspaceId) tempPending = null;
-    console.info("[temp-cwd] abandoned — removing folder + archiving session", path);
-    void hostRemoveDir(path).then(() => workspaces.archiveSession(sessionId)).then(
-      () => {
-        console.info("[temp-cwd] archived session; deleting workspace", workspaceId);
-        return workspaces.delete(workspaceId);
-      },
-      (err) => {
-        console.warn("[temp-cwd] archive failed, deleting workspace anyway:", err);
-        return workspaces.delete(workspaceId);
-      }
-    ).catch((err) => {
-      if (!String(err?.message ?? err).includes("workspace-not-found")) {
-        console.warn("[temp-cwd] abandon cleanup failed:", err);
-      }
-    });
-  };
+function watchFirstMessage(sessions, path, sessionId) {
   const dispose = sessions.list.subscribe(() => {
-    if (done) return;
     const snap = sessions.list.getSnapshot();
     const byId = snap?.byId !== void 0 && snap.byId !== null ? snap.byId : {};
     const entry = byId[sessionId];
-    const firstMessage = entry !== void 0 && entry.blank === false;
-    if (firstMessage) {
-      done = true;
-      dispose();
-      window.clearTimeout(abandonTimer);
-      const pending = tempPending;
-      if (pending !== null && pending.workspaceId === workspaceId) tempPending = null;
-      console.info("[temp-cwd] first message — keeping folder, removing marker", path);
-      void hostRemoveMarker(path).then(() => {
-        console.info("[temp-cwd] marker removed; deleting workspace", workspaceId);
-        return workspaces.delete(workspaceId);
-      }).catch((err) => {
-        console.warn("[temp-cwd] first-message cleanup failed:", err);
-      });
-      return;
-    }
-    const abandoned = snap?.current !== sessionId;
-    if (!abandoned) {
-      abandonCandidate = false;
-      window.clearTimeout(abandonTimer);
-      return;
-    }
-    if (userRequestedClear) {
-      userRequestedClear = false;
-      finalizeAbandon();
-      return;
-    }
-    if (abandonCandidate) return;
-    abandonCandidate = true;
-    abandonTimer = window.setTimeout(() => {
-      if (done) return;
-      const snap2 = sessions.list.getSnapshot();
-      const current2 = snap2?.current;
-      if (current2 === sessionId) {
-        abandonCandidate = false;
-        return;
-      }
-      finalizeAbandon();
-    }, 1200);
+    if (entry === void 0 || entry.blank !== false) return;
+    dispose();
+    if (tempPending !== null && tempPending.sessionId === sessionId) tempPending = null;
+    console.info("[temp-cwd] first message — host finalize (keep folder)", path);
+    void hostFinalize(path);
   });
 }
 function TempCwdHost(props) {
-  const { useWorkspaceList, useSessionList, onStartTemp, onResumeArmCleanup, onPurgeStale } = props;
+  const { useWorkspaceList, useSessionList, onStartTemp } = props;
   const wsItems = useWorkspaceList(
     (snapshot) => Array.isArray(snapshot?.items) ? snapshot.items : EMPTY_ITEMS
   );
@@ -311,7 +195,6 @@ function TempCwdHost(props) {
   const rowRef = React.useRef(null);
   const boundRef = React.useRef(false);
   const transientRef = React.useRef(false);
-  const resumedRef = React.useRef(false);
   rowRef.current = row;
   boundRef.current = bound;
   transientRef.current = transient;
@@ -328,43 +211,6 @@ function TempCwdHost(props) {
     syncTransientUI(transient);
     return () => syncTransientUI(false);
   }, [transient]);
-  React.useEffect(() => {
-    if (resumedRef.current || currentSessionId === void 0) return;
-    const resumed = wsItems.find(
-      (w) => isTempTitle(w.title) && Array.isArray(w.sessionIds) && w.sessionIds.includes(currentSessionId) && sessionById[currentSessionId] !== void 0
-    );
-    if (resumed === void 0) return;
-    const entry = sessionById[currentSessionId];
-    if (entry === void 0 || entry.blank === false) return;
-    const alreadyPending = tempPending !== null && tempPending.workspaceId === resumed.workspaceId;
-    if (alreadyPending) return;
-    resumedRef.current = true;
-    tempPending = { workspaceId: resumed.workspaceId, path: resumed.path };
-    console.info("[temp-cwd] resumed blank temp session; re-arming cleanup", resumed.workspaceId);
-    onResumeArmCleanup(resumed.workspaceId, resumed.path, currentSessionId);
-  }, [wsItems, sessionById, currentSessionId, onResumeArmCleanup]);
-  React.useEffect(() => {
-    if (tempPending !== null) return;
-    const candidates = wsItems.filter((w) => {
-      if (!isTempTitle(w.title)) return false;
-      const sessionsInside = Array.isArray(w.sessionIds) ? w.sessionIds : [];
-      if (currentSessionId !== void 0 && sessionsInside.includes(currentSessionId)) {
-        return false;
-      }
-      return !sweptOrphans.has(w.workspaceId);
-    });
-    if (candidates.length === 0) return;
-    void (async () => {
-      for (const w of candidates) {
-        const info = await hostMarkerInfo(w.path);
-        const stale = info.hasMarker && Date.now() - info.mtimeMs >= PURGE_AGE_MS;
-        if (!stale) continue;
-        sweptOrphans.add(w.workspaceId);
-        console.info("[temp-cwd] purging stale temp workspace on load (marker age ok)", w.workspaceId);
-        await onPurgeStale(w);
-      }
-    })();
-  }, [wsItems]);
   React.useEffect(() => {
     const id = window.setInterval(() => {
       const el = findHeroRow();
@@ -408,10 +254,7 @@ function tempRowRegion() {
     const index = kids.indexOf(wrapper);
     for (let i = index + 1; i < kids.length; i += 1) {
       const sibling = kids[i];
-      const inside = sibling.querySelector(
-        'div[role="treeitem"][class*="projectRow"]'
-      );
-      if (inside !== null) break;
+      if (sibling.querySelector('div[role="treeitem"][class*="projectRow"]') !== null) break;
       if (sibling.querySelector('div[role="treeitem"][class*="sessionRow"]') !== null) {
         out.push(sibling);
       }
@@ -457,8 +300,6 @@ function ensurePillStyle() {
   const tag = document.createElement("style");
   tag.dataset.pluginCss = PILL_CSS_ID;
   tag.textContent = [
-    // Exact chip look: same tokens as the official `…_workspace` chip
-    // (radius 16, min-height 28, 13px/500, label-primary, hover bg).
     "button[data-temp-cwd]{display:inline-flex;align-items:center;gap:4px;min-height:28px;max-width:min(100%,360px);box-sizing:border-box;border-radius:16px;padding:0 8px;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;font-weight:500;line-height:20px;cursor:pointer}",
     "button[data-temp-cwd]:hover{background:var(--dsw-alias-interactive-bg-hover)}",
     'button[data-temp-cwd][data-temp-cwd-state="busy"]{opacity:.65;cursor:wait}',

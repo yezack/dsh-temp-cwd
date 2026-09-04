@@ -13,64 +13,62 @@ const checks = [
   ['returns module.exports', () => code.includes('return module.exports;')],
   ['plugin name export', () => code.includes('var name = "temp-cwd-client"')],
   ['inject slots+sessions+workspaces+uiWorkspace', () => code.includes('var inject = ["slots", "sessions", "workspaces", "uiWorkspace"]')],
-  ['inject sessions', () => code.includes('sessions')],
   ['apply exported', () => /function apply\(ctx\)/.test(code) && code.includes('apply: () => apply')],
   ['slots.inject usage', () => code.includes('slots.inject')],
   ['sidebar.footer.action seat + temp-cwd id (headless host)', () =>
     /slots\.inject\(\s*["']sidebar\.footer\.action["']/.test(code) &&
     /id:\s*["']temp-cwd["']/.test(code)],
-  ['workspaces.create + delete', () => code.includes('workspaces.create({ path })') && /workspaces\.delete\(/.test(code)],
-  ['sessions.create workspaceId', () => code.includes('sessions.create({ workspaceId: workspace.workspaceId })')],
-  ['blank-first-message cleanup (byId registry read)', () => code.includes('sessions.list.subscribe') && code.includes('entry.blank === false') && /snap\??\.current !== sessionId/.test(code) && code.includes('byId[sessionId]')],
-  ['startSession wrapper', () => code.includes('startSession = (workspaceId) => {') && code.includes('sessions.clear()')],
+  ['official store consumption via inject hooks compartment', () =>
+    code.includes('workspaceList: workspaces.list') &&
+    code.includes('sessionList: sessions.list')],
+  ['renderer-bound selector props; no direct useSyncExternalStore', () =>
+    code.includes('useWorkspaceList') &&
+    code.includes('useSessionList') &&
+    !code.includes('useSyncExternalStore')],
+  ['sessionIds binding check (official ui lookup)', () => code.includes('sessionIds.includes')],
+  ['host intents only (v14): start/register/finalize/abandon', () =>
+    code.includes('/api/temp-cwd/start') &&
+    code.includes('/api/temp-cwd/register?p=') &&
+    code.includes('/api/temp-cwd/finalize?p=') &&
+    code.includes('/api/temp-cwd/abandon?p=') &&
+    code.includes('hostRegister') &&
+    code.includes('hostFinalize') &&
+    code.includes('hostAbandon')],
+  ['no client-side workspace/session mutations (host owns cleanup)', () =>
+    !code.includes('workspaces.delete(') &&
+    !code.includes('workspaces.archiveSession(') &&
+    !code.includes('hostRemoveDir') &&
+    !code.includes('remove-dir?p=')],
+  ['tempPending tracks path + sessionId', () =>
+    code.includes('tempPending') &&
+    /\btempPending = \{ path, sessionId \}/.test(code)],
+  ['user new-session sends host abandon', () =>
+    code.includes('userRequestedClear') &&
+    code.includes('sessions.clear()') &&
+    code.includes('hostAbandon(pending.path, pending.sessionId)')],
+  ['first-message watcher sends host finalize (byId registry)', () =>
+    code.includes('byId[sessionId]') &&
+    code.includes('entry.blank !== false') &&
+    code.includes('hostFinalize(path)')],
+  ['startSession wrapper (Bug A)', () =>
+    code.includes('startSession = (workspaceId) => {') &&
+    code.includes('sessions.clear()')],
   ['no hero seat shadowing', () =>
     !/slots\.inject\(["']conversation\.hero/.test(code) &&
     !code.includes('priority: -1') &&
     !code.includes('__reactFiber$') &&
     !code.includes('MutationObserver') &&
     !code.includes('setRootElement')],
-  ['official store consumption via inject hooks compartment (v11)', () =>
-    code.includes('workspaceList: workspaces.list') &&
-    code.includes('sessionList: sessions.list')],
-  ['renderer-bound selector props; no direct useSyncExternalStore (v11)', () =>
-    code.includes('useWorkspaceList') &&
-    code.includes('useSessionList') &&
-    !code.includes('useSyncExternalStore')],
-  ['sessionIds binding check (official ui lookup)', () => code.includes('sessionIds.includes')],
-  ['marker lifecycle host endpoints (v12+)', () =>
-    code.includes('/api/temp-cwd/remove-dir?p=') &&
-    code.includes('/api/temp-cwd/remove-marker?p=') &&
-    code.includes('/api/temp-cwd/info?p=') &&
-    code.includes('hostRemoveDir') &&
-    code.includes('hostRemoveMarker') &&
-    code.includes('hostMarkerInfo')],
-  ['purge age gate + no auto-reopen (v13.7)', () =>
-    code.includes('PURGE_AGE_MS') &&
-    code.includes('Date.now() - info.mtimeMs') &&
-    !code.includes('reopening temp session')],
-  ['tempPending state (workspaceId + path)', () =>
-    code.includes('tempPending') &&
-    code.includes('workspaceId: workspace.workspaceId, path')],
-  ['first-message keeps folder / abandon removes folder + archives session', () =>
-    code.includes('firstMessage') &&
-    code.includes('abandoned') &&
-    code.includes('byId[sessionId]') &&
-    code.includes('workspaces.archiveSession(sessionId)')],
-  ['transient rename, conflict-safe (v13)', () =>
+  ['transient rename, conflict-safe', () =>
     code.includes('TEMP_WS_TITLE') &&
     code.includes('workspaces.rename(workspaceId, title)') &&
     code.includes('workspace-name-conflict')],
-  ['transient UI freeze + sidebar hide (v13)', () =>
+  ['transient UI freeze + sidebar hide', () =>
     code.includes('syncTransientUI') &&
     code.includes('tempcwdFreeze') &&
     code.includes('tempcwdHidden') &&
     code.includes('projectRow') &&
     code.includes('sessionRow')],
-  ['reload resilience + stale purge (v13.5)', () =>
-    code.includes('onResumeArmCleanup') &&
-    code.includes('onPurgeStale') &&
-    code.includes('tempRowRegion') &&
-    code.includes('purgeStaleBeforeCreate')],
   ['zero react-dom (pure-DOM pill)', () =>
     !code.includes('react-dom') &&
     !code.includes('createPortal')],
