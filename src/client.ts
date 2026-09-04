@@ -1,72 +1,64 @@
 /**
- * dsh-temp-cwd — browser half (v9).
+ * dsh-temp-cwd — browser half (v10).
  *
- * v7/v8 tried to put the button in the hero row next to the host's
- * 「选择工作区」 chip — BOTH failed, for two different structural reasons:
+ * v10 redesign (user: "这个插件现在没有任何作用，重新设计一下", then
+ * confirmed the overlay direction: "替换掉整个 [选择工作区] 换成
+ * 选择工作区+开始临时对话，新的选择工作区点击逻辑和原来完全保持一致").
  *
- *   v7 used `conversation.hero.agentPreset`: the official agent-preset
- *   plugin owns that seat at default priority 0 (the 「模式选择」 chip the
- *   user actually sees); we registered at priority 1. The slots kernel
- *   renders the LOWEST priority entry of a single seat — the official seat
- *   won and our button was silently shadowed.
+ * Why v7/v8/v9 could not put the button next to the host's 「选择工作区」 chip:
+ * the chip row (`heroWorkspaceRow`, hardcoded JSX inside ui-conversation's
+ * ConversationRoot) has NO injectable seat. The two hero seats
+ * (`conversation.hero.workspace` / `conversation.hero.agentPreset`) are both
+ * single/root and claimed at priority 0 by official packages; the slots
+ * kernel renders only the lowest-priority winner, so a pure-slot button
+ * cannot coexist there (v7 was shadowed, v8 shadowed the official picker and
+ * broke 「选择工作区」). v9 retreated to `sidebar.footer.action`, but the
+ * button "did nothing" from the user's perspective and the design was
+ * scrapped.
  *
- *   v8 used `conversation.hero.workspace`: the official
- *   dsh-client-ui-workspace package registers the WorkspacePicker MENU on
- *   that seat (also priority 0). We registered at priority -1, won, and in
- *   doing so SHADOWED the official picker — 「选择工作区」 became unclickable
- *   (clicking the chip toggles pickerOpen, but the menu that should render
- *   in that seat was gone).
+ * v10 approach — DOM-overlay pill appended INTO the official hero chip row
+ * (documented in lib/client.js, ConversationRoot, ~line 14191):
  *
- * Both hero seats are single/root and claimed by official packages at
- * priority 0. The slots kernel forbids same-priority double registration
- * (throws) and renders only the lowest-priority winner otherwise — there is
- * NO third seat in the hero row, so a pure-slot button cannot live there
- * without breaking official UI. (v4 did it with fiber/DOM intervention,
- * which v6 deliberately removed.)
+ *   heroWorkspaceRow = <div class="…heroWorkspaceRow">   // flex, gap 2, pl 20
+ *     <button WorkspaceChip …/>                          // 选择工作区 (native)
+ *     <span Menu root/>                                  // empty 0×0 when closed
+ *   </div>
  *
- * v9 therefore returns the button to `sidebar.footer.action` — a LIST seat
- * (kind: list, scope: root, rendered by dsh-client-ui-sidebar), where the
- * official cordis-panel entry and ours coexist instead of fighting:
+ * The row only renders while the conversation is in the blank/hero phase
+ * (no session, or a blank session not attached to a workspace). Once a
+ * session binds a workspace the row unmounts entirely — the pill disappears
+ * with it, no extra logic needed. Verified facts about this profile:
  *
- *   sidebar.footer.action entries (both render, priority-ordered):
- *     ├── cordis-panel (official, id "cordis-panel")
- *     └── temp-cwd     (ours)  ← 「新建临时对话」
+ *   - The workspace picker Menu renders with `portal: true` (ui-primitives
+ *     Menu) → an EMPTY inline span in the row, real list portals to body,
+ *     anchored at the chip's rect. So the native chip + menu keep 100% of
+ *     their behavior; we never touch them.
+ *   - No package registers `conversation.hero.agentPreset` in this profile
+ *     (no 「模式选择」 chip) → steady-state row is chip + empty span.
  *
- * New in v9 — visibility rule: the button only renders while the CURRENT
- * session is not attached to any workspace (`workspaces.items` contains no
- * workspace whose sessionIds includes the current session). Once a session
- * has a workspace the button disappears; it reappears for the ungrouped /
- * no-session state. Implementation is reactive via the official stores:
- * `useSyncExternalStore(workspaces.subscribe, workspaces.getSnapshot)` for
- * the workspace list and the same for `sessions.list` (current session id).
+ * Implementation: a headless host (registered on `sidebar.footer.action`,
+ * renders nothing) tracks the row element by DOM query
+ * `[class*="heroWorkspaceRow"]` — the CSS-module class keeps the readable
+ * `…heroWorkspaceRow` suffix across hash changes — and imperatively appends
+ * a third pill button `[开始临时对话]` (CSS `order: 2`, chip-styled, zero
+ * react-dom). Clicking it runs the v6+ flow unchanged: host mkdir →
+ * workspaces.create → sessions.create({ workspaceId }) → sessions.open →
+ * deferred cleanup after first message / switch away. The official chip
+ * stays untouched: clicking it still toggles pickerOpen and opens the native
+ * picker at its (unchanged, order-1) position.
  *
- * Click flow (all official APIs, unchanged from v6):
- *   1. POST /api/temp-cwd/mkdir        → host creates a temp directory
- *   2. workspaces.create({ path })     → adopt it as a REAL workspace
- *   3. sessions.create({ workspaceId })→ session attached to that workspace
- *   4. sessions.open(sessionId)        → host renders its NATIVE composer;
- *        because the workspace exists the chip has a title and the input bar
- *        is fully usable — byte-for-byte a normal workspace session.
- *   5. Wait until the session leaves `blank` (first message sent) OR the
- *      user switches to another session — then workspaces.delete(id).
- *      The host keeps the files and the session records and moves the
- *      session into 「未分组」 (official: "文件夹与会话记录会保留，其会话将
- *      显示在 '未分组' 下").
- *
- * Why wait for the first message instead of deleting immediately: a blank
- * (no-message) session without a workspace is inherently locked by the host
- * (`inert = hero && chipTitle === void 0` → "选择一个工作区开始" trigger
- * mode). Deleting only AFTER the first message means the composer is native
- * and usable for the entire conversation, and once the session has content
- * the host no longer locks it (hero goes false), so it stays usable after
- * it lands in 「未分组」. Zero DOM intervention, zero custom input.
- *
- * Bug A (kept): an un-argued "new session" must NEVER re-attach the
- * current/recent workspace. The host's uiWorkspace.startSession() resolves
- * `target = workspaceId ?? currentWorkspaceId ?? recentWorkspace(...)`, so we
- * wrap it: un-argued calls go to sessions.clear() — byte-for-byte the host's
- * own `target === void 0` branch — leaving the hero in the empty (ungrouped)
- * state. workspaceId-argued calls pass through untouched.
+ * Robustness notes:
+ *   - The appended node is a foreign child inside a React-owned container.
+ *     React generally leaves unknown children alone, but a future package
+ *     that renders extra in-flow children into the row could collide on
+ *     index-based reconciliation; a 1.2 s interval self-heal re-appends the
+ *     pill whenever the row exists without one. No MutationObserver.
+ *   - If the folder-picker (directoryFlow) package is ever installed and a
+ *     directory flow renders IN the row while open, the pill may get
+ *     disturbed — the interval re-appends it right after. Acceptable.
+ *   - Visibility rule (inherited from v9): pill mounts only while the row
+ *     exists AND the current session is not attached to any workspace
+ *     (belt & braces — normally the row is already gone in that state).
  */
 
 import * as React from 'react'
@@ -79,9 +71,18 @@ export const inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace']
 
 /**
  * Module-level pending temp workspace id. While set, the dispose hook and the
- * button flow own it; it is cleared as soon as the cleanup fires.
+ * flow own it; it is cleared as soon as the cleanup fires.
  */
 let tempWorkspaceId: string | null = null
+
+/** The official hero chip row carries this CSS-module suffix (hash-prefixed). */
+const HERO_ROW_SELECTOR = '[class*="heroWorkspaceRow"]'
+
+/** css tag id for the pill stylesheet (official style-injection pattern). */
+const PILL_CSS_ID = '@yezack/dsh-temp-cwd/pill.css'
+
+/** Pill tooltip (also restored after an error revert). */
+const PILL_TITLE = '创建临时工作区并直接开始对话（发送首条消息后自动归入未分组）'
 
 export function apply(ctx: any): void {
   const workspaces = ctx.workspaces
@@ -114,13 +115,11 @@ export function apply(ctx: any): void {
     }
   })
 
-  // The one and only UI this plugin adds: a 「新建临时对话」 sidebar footer
-  // action. `sidebar.footer.action` is a LIST seat (dsh-client-ui-sidebar
-  // declares kind: list), so the official cordis-panel entry and ours coexist
-  // instead of shadowing each other — unlike the single hero seats that
-  // v7/v8 fought over and broke. No priority needed (both default to 0).
-  // Visibility: the button hides itself while the current session is bound
-  // to a workspace (see TempSessionButton).
+  ensurePillStyle()
+
+  // Headless host. `sidebar.footer.action` is a LIST seat (kind: list) where
+  // our entry coexists with the official cordis-panel entry; the component
+  // renders nothing visible — it only runs the row-scan + pill lifecycle.
   ctx.slots.inject('sidebar.footer.action', () =>
     ctx.slots.register(
       {
@@ -135,7 +134,7 @@ export function apply(ctx: any): void {
           sessionsList: sessions.list,
         }),
       },
-      TempSessionButton,
+      TempCwdHost,
     ),
   )
 }
@@ -200,132 +199,189 @@ function armCleanup(sessions: any, workspaces: any, workspaceId: string, session
 }
 
 /**
- * Sidebar footer action — the single button this plugin adds. Renders only
- * while the current session is NOT attached to any workspace:
- *   - no session at all            → visible (the whole point of the button)
- *   - blank/active ungrouped       → visible
- *   - current session has a workspace → hidden (v9 visibility rule)
- * State is reactive: the workspace list store (`workspaces.subscribe`) tells
- * us which workspaces own which sessionIds; the session list store
- * (`sessions.list`) tells us the current session id.
+ * Headless host — renders nothing. Subscribes to the workspace + session list
+ * stores (any blank↔active transition touches them), finds the official hero
+ * chip row, and appends/removes the 「开始临时对话」 pill.
  */
-function TempSessionButton(props: any) {
+function TempCwdHost(props: any) {
   const { sessions, workspaces, sessionsList } = props
-  const [busy, setBusy] = React.useState(false)
-  const [hovered, setHovered] = React.useState(false)
-  const [error, setError] = React.useState<string | null>(null)
 
-  // Reactive workspace list: `{ items, archivedSessionIds, ... }` snapshot.
-  // getSnapshot() returns the controller's cached snapshot object, so this
-  // is safe for useSyncExternalStore (stable reference between invalidations).
+  // Reactive workspace list snapshot (stable reference between invalidations).
   const wsSnap = React.useSyncExternalStore(
     (listener: () => void) => workspaces.subscribe(listener),
     () => workspaces.getSnapshot(),
   )
-  // Reactive session list: `{ items, current, ... }` — current session id.
+  // Reactive session list snapshot — `current` = active session id.
   const sesSnap = React.useSyncExternalStore(
     (listener: () => void) => sessionsList.subscribe(listener),
     () => sessionsList.getSnapshot(),
   )
 
-  // Hide while the current session is bound to a workspace.
+  const [row, setRow] = React.useState<HTMLElement | null>(null)
+  const pillRef = React.useRef<HTMLButtonElement | null>(null)
+  const rowRef = React.useRef<HTMLElement | null>(null)
+  const boundRef = React.useRef<boolean>(false)
+
   const currentSessionId = sesSnap.current as string | undefined
   const boundWorkspace =
     currentSessionId === undefined
       ? undefined
       : wsSnap.items.find((w: any) => w.sessionIds.includes(currentSessionId))
-  if (boundWorkspace !== undefined) return null
 
-  const handle = async () => {
-    if (busy) return
-    setBusy(true)
-    setError(null)
-    try {
-      await createTempSession(sessions, workspaces)
-    } catch (err) {
-      console.error('[temp-cwd] failed to open temp session:', err)
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(false)
+  // Keep refs in sync so the interval tick can read current values.
+  rowRef.current = row
+  boundRef.current = boundWorkspace !== undefined
+
+  // Store-driven rescan: session/workspace transitions remount/unmount the
+  // hero row, so re-locate it every time the state we care about changes.
+  React.useEffect(() => {
+    setRow(findHeroRow())
+  }, [currentSessionId, boundWorkspace?.workspaceId])
+
+  // Mount effect: attach the pill to the current row (if any) whenever the
+  // row element or the bound-state changes; remove it otherwise.
+  React.useEffect(() => {
+    removePill(pillRef)
+    if (row === null || boundWorkspace !== undefined) return
+    pillRef.current = mountPill(row, sessions, workspaces)
+    return () => removePill(pillRef)
+  }, [row, boundWorkspace?.workspaceId, sessions, workspaces])
+
+  // Self-heal tick: catch row remounts that never touch the stores and any
+  // React reconciliation that disturbed the appended pill (re-append within
+  // ~1.2 s). Cheap: one querySelector when nothing changed.
+  React.useEffect(() => {
+    const id = window.setInterval(() => {
+      const el = findHeroRow()
+      if (el !== rowRef.current) {
+        setRow(el)
+        return
+      }
+      const pill = pillRef.current
+      const shouldMount = el !== null && !boundRef.current
+      if (shouldMount && (pill === null || !el.contains(pill))) {
+        removePill(pillRef)
+        pillRef.current = mountPill(el, sessions, workspaces)
+      } else if (!shouldMount && pill !== null) {
+        removePill(pillRef)
+      }
+    }, 1200)
+    return () => window.clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Headless: nothing visible from this seat.
+  return null
+}
+
+/* ---- pill DOM (imperative — deliberately no react-dom) ---- */
+
+/** Inject the pill stylesheet once (official data-plugin-css convention). */
+function ensurePillStyle(): void {
+  if (typeof document === 'undefined') return
+  if (document.querySelector(`style[data-plugin-css="${PILL_CSS_ID}"]`) !== null) return
+  const tag = document.createElement('style')
+  tag.dataset.pluginCss = PILL_CSS_ID
+  tag.textContent = [
+    // Exact chip look: same tokens as the official `…_workspace` chip
+    // (radius 16, min-height 28, 13px/500, label-primary, hover bg).
+    'button[data-temp-cwd]{display:inline-flex;align-items:center;gap:4px;min-height:28px;max-width:min(100%,360px);box-sizing:border-box;border-radius:16px;padding:0 8px;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;font-weight:500;line-height:20px;cursor:pointer;order:2}',
+    'button[data-temp-cwd]:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+    'button[data-temp-cwd][data-temp-cwd-state="busy"]{opacity:.65;cursor:wait}',
+    'button[data-temp-cwd] svg{flex-shrink:0}',
+    'button[data-temp-cwd] span{white-space:nowrap}',
+  ].join('\n')
+  document.head.appendChild(tag)
+}
+
+/** Find the visible official hero chip row (blank conversation state). */
+function findHeroRow(): HTMLElement | null {
+  const nodes = Array.from(document.querySelectorAll(HERO_ROW_SELECTOR))
+  const visible = nodes.find(
+    (el) => el instanceof HTMLElement && el.getClientRects().length > 0 && el.offsetParent !== null,
+  )
+  return (visible ?? nodes[0] ?? null) as HTMLElement | null
+}
+
+/** Detach the mounted pill, if any. */
+function removePill(pillRef: React.MutableRefObject<HTMLButtonElement | null>): void {
+  const pill = pillRef.current
+  pillRef.current = null
+  if (pill !== null && pill.isConnected) pill.remove()
+}
+
+/**
+ * Append the 「开始临时对话」 pill to the official hero chip row and wire its
+ * click to the temp-session flow. Returns the button (caller keeps it in a
+ * ref for removal / self-heal). Busy/error feedback is imperative DOM text
+ * updates — no react-dom, no re-render loop.
+ */
+function mountPill(row: HTMLElement, sessions: any, workspaces: any): HTMLButtonElement {
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.setAttribute('data-temp-cwd', '')
+  btn.setAttribute('data-temp-cwd-state', 'idle')
+  btn.title = PILL_TITLE
+  btn.innerHTML = `${PLUS_SVG}<span>开始临时对话</span>`
+  const label = btn.querySelector('span') as HTMLSpanElement | null
+
+  let busy = false
+  let revertTimer = 0
+
+  const setBusy = () => {
+    if (!btn.isConnected) return
+    btn.setAttribute('data-temp-cwd-state', 'busy')
+    if (label !== null) label.textContent = '创建中…'
+  }
+  const setIdle = () => {
+    if (!btn.isConnected) return
+    btn.setAttribute('data-temp-cwd-state', 'idle')
+    if (label !== null) {
+      label.textContent = '开始临时对话'
+      label.style.color = ''
     }
+    btn.title = PILL_TITLE
+  }
+  const showError = (message: string) => {
+    if (!btn.isConnected) return
+    btn.setAttribute('data-temp-cwd-state', 'idle')
+    if (label !== null) {
+      label.textContent = '创建失败'
+      label.style.color = 'var(--dsw-alias-danger, #f56c6c)'
+    }
+    btn.title = message
   }
 
-  return React.createElement(
-    React.Fragment,
-    null,
-    React.createElement(
-      'button',
-      {
-        type: 'button',
-        disabled: busy,
-        onClick: handle,
-        onMouseEnter: () => setHovered(true),
-        onMouseLeave: () => setHovered(false),
-        title: '创建临时工作区并直接开始对话（发出第一条消息后自动进入未分组）',
-        style: {
-          ...actionButtonStyle,
-          background: hovered ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
-          opacity: busy ? 0.65 : 1,
-          cursor: busy ? 'wait' : 'pointer',
-        },
-      },
-      plusIcon(),
-      busy ? '创建中…' : '新建临时对话',
-    ),
-    error
-      ? React.createElement('div', { role: 'alert', style: errorStyle }, error)
-      : null,
-  )
+  btn.addEventListener('click', () => {
+    if (busy || !btn.isConnected) return
+    busy = true
+    window.clearTimeout(revertTimer)
+    setBusy()
+    createTempSession(sessions, workspaces)
+      .catch((err: unknown) => {
+        console.error('[temp-cwd] failed to open temp session:', err)
+        const message = err instanceof Error ? err.message : String(err)
+        showError(message)
+        revertTimer = window.setTimeout(setIdle, 3000)
+      })
+      .finally(() => {
+        busy = false
+        // Success normally unmounts the row (session becomes active); only
+        // revert to idle if the pill is still around (e.g. still settling).
+        if (btn.isConnected && btn.getAttribute('data-temp-cwd-state') !== 'idle') {
+          setIdle()
+        }
+      })
+  })
+
+  row.appendChild(btn)
+  return btn
 }
 
 /* ---- helpers ---- */
 
-/** Minimal lucide-style plus glyph. */
-function plusIcon() {
-  return React.createElement(
-    'svg',
-    {
-      width: 14,
-      height: 14,
-      viewBox: '0 0 24 24',
-      fill: 'none',
-      stroke: 'currentColor',
-      strokeWidth: 2,
-      strokeLinecap: 'round',
-      strokeLinejoin: 'round',
-      style: { flexShrink: 0 },
-    },
-    React.createElement('path', { d: 'M5 12h14' }),
-    React.createElement('path', { d: 'M12 5v14' }),
-  )
-}
-
-/* ---- inline styles (host design tokens only) ---- */
-
-/** Full-width sidebar footer action, harmonized with the host's footer. */
-const actionButtonStyle = {
-  display: 'flex',
-  alignItems: 'center',
-  gap: 6,
-  width: '100%',
-  boxSizing: 'border-box',
-  minWidth: 0,
-  padding: '6px 8px',
-  borderRadius: 8,
-  border: 'none',
-  color: 'var(--dsw-alias-label-secondary)',
-  fontSize: 13,
-  fontWeight: 500,
-  lineHeight: '20px',
-  textAlign: 'left',
-  whiteSpace: 'nowrap',
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-}
-
-const errorStyle = {
-  color: 'var(--dsw-alias-danger, #f56c6c)',
-  fontSize: 12,
-  lineHeight: '16px',
-  padding: '2px 8px 4px',
-}
+/** 14px plus glyph (lucide-style), matching the host's stroke aesthetics. */
+const PLUS_SVG =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M5 12h14"/><path d="M12 5v14"/></svg>'

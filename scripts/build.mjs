@@ -19,6 +19,7 @@ await build({
   platform: 'node',
   format: 'esm',
   target: 'node20',
+  charset: 'utf8',
   external: ['schemastery'],
   outfile: 'dist/index.js',
 })
@@ -29,6 +30,7 @@ await build({
   platform: 'browser',
   format: 'cjs',
   target: 'es2020',
+  charset: 'utf8',
   external: ['react', 'react-dom', 'react/jsx-runtime'],
   outfile: 'dist/client-core.js',
 })

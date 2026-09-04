@@ -16,7 +16,7 @@ const checks = [
   ['inject sessions', () => code.includes('sessions')],
   ['apply exported', () => /function apply\(ctx\)/.test(code) && code.includes('apply: () => apply')],
   ['slots.inject usage', () => code.includes('slots.inject')],
-  ['sidebar.footer.action slot + temp-cwd id (v9)', () =>
+  ['sidebar.footer.action seat + temp-cwd id (headless host, v10)', () =>
     /slots\.inject\(\s*["']sidebar\.footer\.action["']/.test(code) &&
     /id:\s*["']temp-cwd["']/.test(code)],
   ['workspaces.create + delete', () => code.includes('workspaces.create({ path })') && code.includes('workspaces.delete(workspace.workspaceId)')],
@@ -29,11 +29,23 @@ const checks = [
     !code.includes('__reactFiber$') &&
     !code.includes('MutationObserver') &&
     !code.includes('setRootElement')],
-  ['reactive hide via useSyncExternalStore (v9)', () =>
+  ['reactive stores via useSyncExternalStore', () =>
     code.includes('useSyncExternalStore') &&
     code.includes('workspaces.subscribe') &&
     code.includes('sessionsList.subscribe') &&
     code.includes('sessionIds.includes')],
+  ['zero react-dom (v10 pure-DOM pill)', () =>
+    !code.includes('react-dom') &&
+    !code.includes('createPortal')],
+  ['hero row finder (v10)', () => code.includes('[class*="heroWorkspaceRow"]')],
+  ['imperative pill mount (v10)', () =>
+    code.includes('data-temp-cwd') &&
+    code.includes('mountPill') &&
+    code.includes('ensurePillStyle') &&
+    code.includes('开始临时对话')],
+  ['row self-heal interval (v10)', () =>
+    code.includes('setInterval') &&
+    code.includes('el.contains(pill)')],
 ]
 
 let failed = false
