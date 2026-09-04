@@ -43,6 +43,9 @@ var React = __toESM(require("react"), 1);
 var name = "temp-cwd-client";
 var inject = ["slots", "sessions", "workspaces", "uiWorkspace"];
 var tempWorkspaceId = null;
+var HERO_ROW_SELECTOR = '[class*="heroWorkspaceRow"]';
+var PILL_CSS_ID = "@yezack/dsh-temp-cwd/pill.css";
+var PILL_TITLE = "创建临时工作区并直接开始对话（发送首条消息后自动归入未分组）";
 function apply(ctx) {
   const workspaces = ctx.workspaces;
   const sessions = ctx.sessions;
@@ -64,6 +67,7 @@ function apply(ctx) {
       });
     }
   });
+  ensurePillStyle();
   ctx.slots.inject(
     "sidebar.footer.action",
     () => ctx.slots.register(
@@ -79,7 +83,7 @@ function apply(ctx) {
           sessionsList: sessions.list
         })
       },
-      TempSessionButton
+      TempCwdHost
     )
   );
 }
@@ -116,11 +120,8 @@ function armCleanup(sessions, workspaces, workspaceId, sessionId) {
     }
   });
 }
-function TempSessionButton(props) {
+function TempCwdHost(props) {
   const { sessions, workspaces, sessionsList } = props;
-  const [busy, setBusy] = React.useState(false);
-  const [hovered, setHovered] = React.useState(false);
-  const [error, setError] = React.useState(null);
   const wsSnap = React.useSyncExternalStore(
     (listener) => workspaces.subscribe(listener),
     () => workspaces.getSnapshot()
@@ -129,90 +130,125 @@ function TempSessionButton(props) {
     (listener) => sessionsList.subscribe(listener),
     () => sessionsList.getSnapshot()
   );
+  const [row, setRow] = React.useState(null);
+  const pillRef = React.useRef(null);
+  const rowRef = React.useRef(null);
+  const boundRef = React.useRef(false);
   const currentSessionId = sesSnap.current;
   const boundWorkspace = currentSessionId === void 0 ? void 0 : wsSnap.items.find((w) => w.sessionIds.includes(currentSessionId));
-  if (boundWorkspace !== void 0) return null;
-  const handle = async () => {
-    if (busy) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await createTempSession(sessions, workspaces);
-    } catch (err) {
-      console.error("[temp-cwd] failed to open temp session:", err);
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
+  rowRef.current = row;
+  boundRef.current = boundWorkspace !== void 0;
+  React.useEffect(() => {
+    setRow(findHeroRow());
+  }, [currentSessionId, boundWorkspace?.workspaceId]);
+  React.useEffect(() => {
+    removePill(pillRef);
+    if (row === null || boundWorkspace !== void 0) return;
+    pillRef.current = mountPill(row, sessions, workspaces);
+    return () => removePill(pillRef);
+  }, [row, boundWorkspace?.workspaceId, sessions, workspaces]);
+  React.useEffect(() => {
+    const id = window.setInterval(() => {
+      const el = findHeroRow();
+      if (el !== rowRef.current) {
+        setRow(el);
+        return;
+      }
+      const pill = pillRef.current;
+      const shouldMount = el !== null && !boundRef.current;
+      if (shouldMount && (pill === null || !el.contains(pill))) {
+        removePill(pillRef);
+        pillRef.current = mountPill(el, sessions, workspaces);
+      } else if (!shouldMount && pill !== null) {
+        removePill(pillRef);
+      }
+    }, 1200);
+    return () => window.clearInterval(id);
+  }, []);
+  return null;
+}
+function ensurePillStyle() {
+  if (typeof document === "undefined") return;
+  if (document.querySelector(`style[data-plugin-css="${PILL_CSS_ID}"]`) !== null) return;
+  const tag = document.createElement("style");
+  tag.dataset.pluginCss = PILL_CSS_ID;
+  tag.textContent = [
+    // Exact chip look: same tokens as the official `…_workspace` chip
+    // (radius 16, min-height 28, 13px/500, label-primary, hover bg).
+    "button[data-temp-cwd]{display:inline-flex;align-items:center;gap:4px;min-height:28px;max-width:min(100%,360px);box-sizing:border-box;border-radius:16px;padding:0 8px;border:none;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;font-weight:500;line-height:20px;cursor:pointer;order:2}",
+    "button[data-temp-cwd]:hover{background:var(--dsw-alias-interactive-bg-hover)}",
+    'button[data-temp-cwd][data-temp-cwd-state="busy"]{opacity:.65;cursor:wait}',
+    "button[data-temp-cwd] svg{flex-shrink:0}",
+    "button[data-temp-cwd] span{white-space:nowrap}"
+  ].join("\n");
+  document.head.appendChild(tag);
+}
+function findHeroRow() {
+  const nodes = Array.from(document.querySelectorAll(HERO_ROW_SELECTOR));
+  const visible = nodes.find(
+    (el) => el instanceof HTMLElement && el.getClientRects().length > 0 && el.offsetParent !== null
+  );
+  return visible ?? nodes[0] ?? null;
+}
+function removePill(pillRef) {
+  const pill = pillRef.current;
+  pillRef.current = null;
+  if (pill !== null && pill.isConnected) pill.remove();
+}
+function mountPill(row, sessions, workspaces) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.setAttribute("data-temp-cwd", "");
+  btn.setAttribute("data-temp-cwd-state", "idle");
+  btn.title = PILL_TITLE;
+  btn.innerHTML = `${PLUS_SVG}<span>开始临时对话</span>`;
+  const label = btn.querySelector("span");
+  let busy = false;
+  let revertTimer = 0;
+  const setBusy = () => {
+    if (!btn.isConnected) return;
+    btn.setAttribute("data-temp-cwd-state", "busy");
+    if (label !== null) label.textContent = "创建中…";
   };
-  return React.createElement(
-    React.Fragment,
-    null,
-    React.createElement(
-      "button",
-      {
-        type: "button",
-        disabled: busy,
-        onClick: handle,
-        onMouseEnter: () => setHovered(true),
-        onMouseLeave: () => setHovered(false),
-        title: "\u521B\u5EFA\u4E34\u65F6\u5DE5\u4F5C\u533A\u5E76\u76F4\u63A5\u5F00\u59CB\u5BF9\u8BDD\uFF08\u53D1\u51FA\u7B2C\u4E00\u6761\u6D88\u606F\u540E\u81EA\u52A8\u8FDB\u5165\u672A\u5206\u7EC4\uFF09",
-        style: {
-          ...actionButtonStyle,
-          background: hovered ? "var(--dsw-alias-interactive-bg-hover)" : "transparent",
-          opacity: busy ? 0.65 : 1,
-          cursor: busy ? "wait" : "pointer"
-        }
-      },
-      plusIcon(),
-      busy ? "\u521B\u5EFA\u4E2D\u2026" : "\u65B0\u5EFA\u4E34\u65F6\u5BF9\u8BDD"
-    ),
-    error ? React.createElement("div", { role: "alert", style: errorStyle }, error) : null
-  );
+  const setIdle = () => {
+    if (!btn.isConnected) return;
+    btn.setAttribute("data-temp-cwd-state", "idle");
+    if (label !== null) {
+      label.textContent = "开始临时对话";
+      label.style.color = "";
+    }
+    btn.title = PILL_TITLE;
+  };
+  const showError = (message) => {
+    if (!btn.isConnected) return;
+    btn.setAttribute("data-temp-cwd-state", "idle");
+    if (label !== null) {
+      label.textContent = "创建失败";
+      label.style.color = "var(--dsw-alias-danger, #f56c6c)";
+    }
+    btn.title = message;
+  };
+  btn.addEventListener("click", () => {
+    if (busy || !btn.isConnected) return;
+    busy = true;
+    window.clearTimeout(revertTimer);
+    setBusy();
+    createTempSession(sessions, workspaces).catch((err) => {
+      console.error("[temp-cwd] failed to open temp session:", err);
+      const message = err instanceof Error ? err.message : String(err);
+      showError(message);
+      revertTimer = window.setTimeout(setIdle, 3e3);
+    }).finally(() => {
+      busy = false;
+      if (btn.isConnected && btn.getAttribute("data-temp-cwd-state") !== "idle") {
+        setIdle();
+      }
+    });
+  });
+  row.appendChild(btn);
+  return btn;
 }
-function plusIcon() {
-  return React.createElement(
-    "svg",
-    {
-      width: 14,
-      height: 14,
-      viewBox: "0 0 24 24",
-      fill: "none",
-      stroke: "currentColor",
-      strokeWidth: 2,
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-      style: { flexShrink: 0 }
-    },
-    React.createElement("path", { d: "M5 12h14" }),
-    React.createElement("path", { d: "M12 5v14" })
-  );
-}
-var actionButtonStyle = {
-  display: "flex",
-  alignItems: "center",
-  gap: 6,
-  width: "100%",
-  boxSizing: "border-box",
-  minWidth: 0,
-  padding: "6px 8px",
-  borderRadius: 8,
-  border: "none",
-  color: "var(--dsw-alias-label-secondary)",
-  fontSize: 13,
-  fontWeight: 500,
-  lineHeight: "20px",
-  textAlign: "left",
-  whiteSpace: "nowrap",
-  overflow: "hidden",
-  textOverflow: "ellipsis"
-};
-var errorStyle = {
-  color: "var(--dsw-alias-danger, #f56c6c)",
-  fontSize: 12,
-  lineHeight: "16px",
-  padding: "2px 8px 4px"
-};
+var PLUS_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>';
 
 		return module.exports;
 	}
