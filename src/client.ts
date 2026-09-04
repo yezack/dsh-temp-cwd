@@ -1,64 +1,39 @@
 /**
- * dsh-temp-cwd — browser half (v10).
+ * dsh-temp-cwd — browser half (v11).
  *
- * v10 redesign (user: "这个插件现在没有任何作用，重新设计一下", then
- * confirmed the overlay direction: "替换掉整个 [选择工作区] 换成
- * 选择工作区+开始临时对话，新的选择工作区点击逻辑和原来完全保持一致").
+ * Placement (user-confirmed): the 「开始临时对话」 pill stays inside the
+ * official hero chip row (`heroWorkspaceRow`), because that row has no
+ * injectable seat — both hero seats (`conversation.hero.workspace` /
+ * `conversation.hero.agentPreset`) are single/root and occupied by official
+ * packages, so a slot cell can never coexist there (v7/v8/v9 history). v11
+ * keeps the single DOM append (one plain `<button data-temp-cwd>` in the row)
+ * but officializes everything around it:
  *
- * Why v7/v8/v9 could not put the button next to the host's 「选择工作区」 chip:
- * the chip row (`heroWorkspaceRow`, hardcoded JSX inside ui-conversation's
- * ConversationRoot) has NO injectable seat. The two hero seats
- * (`conversation.hero.workspace` / `conversation.hero.agentPreset`) are both
- * single/root and claimed at priority 0 by official packages; the slots
- * kernel renders only the lowest-priority winner, so a pure-slot button
- * cannot coexist there (v7 was shadowed, v8 shadowed the official picker and
- * broke 「选择工作区」). v9 retreated to `sidebar.footer.action`, but the
- * button "did nothing" from the user's perspective and the design was
- * scrapped.
+ *  - Store consumption goes through the official inject `hooks` compartment.
+ *    The slot renderer turns bare Observable sources (`subscribe` /
+ *    `getSnapshot`) into selector props (`useWorkspaceList`,
+ *    `useSessionList`) — components never reach into models directly and
+ *    never call `useSyncExternalStore` themselves (renderer does it).
+ *    v10 crashed exactly here: it called `workspaces.getSnapshot` on the
+ *    *controller* (`ctx.workspaces`), which only has commands
+ *    (create/delete/rename); `subscribe`/`getSnapshot` live on the model
+ *    exposed as `ctx.workspaces.list` (and `ctx.sessions.list`).
+ *  - Services stay in the `apply` closure; components receive only
+ *    callbacks (`onStartTemp`) plus bound selector hooks.
+ *  - The headless host registers on the `sidebar.footer.action` LIST seat
+ *    (id `temp-cwd`) purely for lifecycle — it renders nothing there.
  *
- * v10 approach — DOM-overlay pill appended INTO the official hero chip row
- * (documented in lib/client.js, ConversationRoot, ~line 14191):
+ * Click flow (unchanged from v6+): host mkdir → `workspaces.create({ path })`
+ * → `sessions.create({ workspaceId })` → `sessions.open` → deferred cleanup
+ * after the first message (blank → false) or after switching away. Cleanup
+ * subscribes to `sessions.list` at apply level (model API, not React).
  *
- *   heroWorkspaceRow = <div class="…heroWorkspaceRow">   // flex, gap 2, pl 20
- *     <button WorkspaceChip …/>                          // 选择工作区 (native)
- *     <span Menu root/>                                  // empty 0×0 when closed
- *   </div>
- *
- * The row only renders while the conversation is in the blank/hero phase
- * (no session, or a blank session not attached to a workspace). Once a
- * session binds a workspace the row unmounts entirely — the pill disappears
- * with it, no extra logic needed. Verified facts about this profile:
- *
- *   - The workspace picker Menu renders with `portal: true` (ui-primitives
- *     Menu) → an EMPTY inline span in the row, real list portals to body,
- *     anchored at the chip's rect. So the native chip + menu keep 100% of
- *     their behavior; we never touch them.
- *   - No package registers `conversation.hero.agentPreset` in this profile
- *     (no 「模式选择」 chip) → steady-state row is chip + empty span.
- *
- * Implementation: a headless host (registered on `sidebar.footer.action`,
- * renders nothing) tracks the row element by DOM query
- * `[class*="heroWorkspaceRow"]` — the CSS-module class keeps the readable
- * `…heroWorkspaceRow` suffix across hash changes — and imperatively appends
- * a third pill button `[开始临时对话]` (CSS `order: 2`, chip-styled, zero
- * react-dom). Clicking it runs the v6+ flow unchanged: host mkdir →
- * workspaces.create → sessions.create({ workspaceId }) → sessions.open →
- * deferred cleanup after first message / switch away. The official chip
- * stays untouched: clicking it still toggles pickerOpen and opens the native
- * picker at its (unchanged, order-1) position.
- *
- * Robustness notes:
- *   - The appended node is a foreign child inside a React-owned container.
- *     React generally leaves unknown children alone, but a future package
- *     that renders extra in-flow children into the row could collide on
- *     index-based reconciliation; a 1.2 s interval self-heal re-appends the
- *     pill whenever the row exists without one. No MutationObserver.
- *   - If the folder-picker (directoryFlow) package is ever installed and a
- *     directory flow renders IN the row while open, the pill may get
- *     disturbed — the interval re-appends it right after. Acceptable.
- *   - Visibility rule (inherited from v9): pill mounts only while the row
- *     exists AND the current session is not attached to any workspace
- *     (belt & braces — normally the row is already gone in that state).
+ * Visibility rule: the pill mounts only while the hero row exists AND the
+ * current session is not attached to any workspace (`workspace.sessionIds`
+ * lookup — the same binding check the official ui-workspace / ui-conversation
+ * code uses). Since the row unmounts when a session binds a workspace, this
+ * is belt & braces; a 1.2 s interval self-heals the pill after React
+ * reconciliation disturbs the appended foreign child.
  */
 
 import * as React from 'react'
@@ -66,12 +41,12 @@ import * as React from 'react'
 /** Stable cordis plugin name (browser half). */
 export const name = 'temp-cwd-client'
 
-/** Services required before the slot entry can mount. */
+/** Services required before the plugin can mount. */
 export const inject = ['slots', 'sessions', 'workspaces', 'uiWorkspace']
 
 /**
  * Module-level pending temp workspace id. While set, the dispose hook and the
- * flow own it; it is cleared as soon as the cleanup fires.
+ * flow own it; cleared as soon as the cleanup fires.
  */
 let tempWorkspaceId: string | null = null
 
@@ -91,8 +66,8 @@ export function apply(ctx: any): void {
 
   // Bug A: an un-argued "new session" must NEVER re-attach the current/recent
   // workspace. The host's own startSession treats `target === void 0` by
-  // calling sessions.clear() — replicate exactly that for un-argued calls,
-  // and leave workspaceId-argued calls (explicit pick) untouched.
+  // calling sessions.clear() — replicate that for un-argued calls, leave
+  // workspaceId-argued calls (explicit pick) untouched.
   const originalStartSession = uiWorkspace.startSession.bind(uiWorkspace)
   uiWorkspace.startSession = (workspaceId?: string) => {
     if (workspaceId === void 0) {
@@ -102,9 +77,8 @@ export function apply(ctx: any): void {
     originalStartSession(workspaceId)
   }
 
-  // Safety net: if the plugin is ever disposed while a temp workspace is
-  // still pending (e.g. the app closes before the first message), remove it
-  // so nothing leaks in the workspace list.
+  // Safety net: if the plugin is disposed while a temp workspace is still
+  // pending (e.g. the app closes before the first message), remove it.
   ctx.on('dispose', () => {
     if (tempWorkspaceId !== null) {
       const id = tempWorkspaceId
@@ -117,21 +91,24 @@ export function apply(ctx: any): void {
 
   ensurePillStyle()
 
-  // Headless host. `sidebar.footer.action` is a LIST seat (kind: list) where
-  // our entry coexists with the official cordis-panel entry; the component
-  // renders nothing visible — it only runs the row-scan + pill lifecycle.
+  // Headless host on the official sidebar.footer.action LIST seat (renders
+  // nothing visible). Entry-owned `inject` projects:
+  //   hooks: { workspaceList, sessionList } — bare models; renderer binds
+  //          them into useWorkspaceList/useSessionList selector props.
+  //   onStartTemp — the temp-session action, kept in the apply closure.
   ctx.slots.inject('sidebar.footer.action', () =>
     ctx.slots.register(
       {
         name: 'sidebar.footer.action',
         id: 'temp-cwd',
         inject: () => ({
-          /** Official session controller: create({ workspaceId }) / open(id). */
-          sessions,
-          /** Official workspace controller: create({ path }) / delete(id). */
-          workspaces,
-          /** Session list projection model: subscribe / getSnapshot (items carry `blank`). */
-          sessionsList: sessions.list,
+          hooks: {
+            /** Workspace model: subscribe/getSnapshot → { items, phase, … }. */
+            workspaceList: workspaces.list,
+            /** Session list model: subscribe/getSnapshot → { items, current, … }. */
+            sessionList: sessions.list,
+          },
+          onStartTemp: () => createTempSession(sessions, workspaces),
         }),
       },
       TempCwdHost,
@@ -161,9 +138,7 @@ async function createTempSession(sessions: any, workspaces: any): Promise<void> 
     // 4. Open it — native InputBar / Lexical composer, chip shows a real title.
     await sessions.open(sessionId)
 
-    // 5. Deferred cleanup: wait for the first message (blank → false) or for
-    //    the user to switch away, then delete the workspace. The host keeps
-    //    the files and session records and moves the session into 「未分组」.
+    // 5. Deferred cleanup: first message (blank → false) or switch away.
     armCleanup(sessions, workspaces, workspace.workspaceId, sessionId)
   } catch (err) {
     // Session create/open failed — don't leave a dangling workspace behind.
@@ -174,12 +149,9 @@ async function createTempSession(sessions: any, workspaces: any): Promise<void> 
 }
 
 /**
- * Subscribe to the session list projection and delete the temp workspace at
- * the first moment it is safe:
- *   - the session got its first message (`entry.blank === false`), or
- *   - the user switched to another session (`snap.current !== sessionId`).
- * The subscription is torn down on the first match; the workspace delete is
- * fire-and-forget (logged on failure).
+ * Subscribe to the session list model and delete the temp workspace at the
+ * first moment it is safe (first message sent, or the user switched away).
+ * Torn down on first match; delete is fire-and-forget (logged on failure).
  */
 function armCleanup(sessions: any, workspaces: any, workspaceId: string, sessionId: string): void {
   let done = false
@@ -199,53 +171,55 @@ function armCleanup(sessions: any, workspaces: any, workspaceId: string, session
 }
 
 /**
- * Headless host — renders nothing. Subscribes to the workspace + session list
- * stores (any blank↔active transition touches them), finds the official hero
- * chip row, and appends/removes the 「开始临时对话」 pill.
+ * Headless host — renders nothing. Consumes the two models through the
+ * renderer-bound selector hooks (`useWorkspaceList` / `useSessionList`) the
+ * same way official slot components do, finds the official hero chip row,
+ * and appends/removes the 「开始临时对话」 pill.
  */
-function TempCwdHost(props: any) {
-  const { sessions, workspaces, sessionsList } = props
+function TempCwdHost(props: {
+  /** Renderer-bound selector hook over ctx.workspaces.list. */
+  useWorkspaceList: <T>(selector: (snapshot: any) => T) => T
+  /** Renderer-bound selector hook over ctx.sessions.list. */
+  useSessionList: <T>(selector: (snapshot: any) => T) => T
+  /** Temp-session action (closure in apply). */
+  onStartTemp: () => Promise<void>
+}) {
+  const { useWorkspaceList, useSessionList, onStartTemp } = props
 
-  // Reactive workspace list snapshot (stable reference between invalidations).
-  const wsSnap = React.useSyncExternalStore(
-    (listener: () => void) => workspaces.subscribe(listener),
-    () => workspaces.getSnapshot(),
-  )
-  // Reactive session list snapshot — `current` = active session id.
-  const sesSnap = React.useSyncExternalStore(
-    (listener: () => void) => sessionsList.subscribe(listener),
-    () => sessionsList.getSnapshot(),
-  )
+  // Workspace items (reference-stable between invalidations) — each carries
+  // `sessionIds`; the official ui-conversation / ui-workspace code resolves
+  // a session's workspace exactly this way.
+  const wsItems = useWorkspaceList((snapshot) => snapshot.items)
+  // Current session id (undefined while no session is selected).
+  const currentSessionId = useSessionList((snapshot) => snapshot.current)
+
+  const bound =
+    currentSessionId !== undefined &&
+    wsItems.some((w: any) => w.sessionIds.includes(currentSessionId))
 
   const [row, setRow] = React.useState<HTMLElement | null>(null)
   const pillRef = React.useRef<HTMLButtonElement | null>(null)
   const rowRef = React.useRef<HTMLElement | null>(null)
   const boundRef = React.useRef<boolean>(false)
 
-  const currentSessionId = sesSnap.current as string | undefined
-  const boundWorkspace =
-    currentSessionId === undefined
-      ? undefined
-      : wsSnap.items.find((w: any) => w.sessionIds.includes(currentSessionId))
-
   // Keep refs in sync so the interval tick can read current values.
   rowRef.current = row
-  boundRef.current = boundWorkspace !== undefined
+  boundRef.current = bound
 
   // Store-driven rescan: session/workspace transitions remount/unmount the
   // hero row, so re-locate it every time the state we care about changes.
   React.useEffect(() => {
     setRow(findHeroRow())
-  }, [currentSessionId, boundWorkspace?.workspaceId])
+  }, [currentSessionId, bound])
 
   // Mount effect: attach the pill to the current row (if any) whenever the
   // row element or the bound-state changes; remove it otherwise.
   React.useEffect(() => {
     removePill(pillRef)
-    if (row === null || boundWorkspace !== undefined) return
-    pillRef.current = mountPill(row, sessions, workspaces)
+    if (row === null || bound) return
+    pillRef.current = mountPill(row, onStartTemp)
     return () => removePill(pillRef)
-  }, [row, boundWorkspace?.workspaceId, sessions, workspaces])
+  }, [row, bound, onStartTemp])
 
   // Self-heal tick: catch row remounts that never touch the stores and any
   // React reconciliation that disturbed the appended pill (re-append within
@@ -261,7 +235,7 @@ function TempCwdHost(props: any) {
       const shouldMount = el !== null && !boundRef.current
       if (shouldMount && (pill === null || !el.contains(pill))) {
         removePill(pillRef)
-        pillRef.current = mountPill(el, sessions, workspaces)
+        pillRef.current = mountPill(el, onStartTemp)
       } else if (!shouldMount && pill !== null) {
         removePill(pillRef)
       }
@@ -316,7 +290,7 @@ function removePill(pillRef: React.MutableRefObject<HTMLButtonElement | null>): 
  * ref for removal / self-heal). Busy/error feedback is imperative DOM text
  * updates — no react-dom, no re-render loop.
  */
-function mountPill(row: HTMLElement, sessions: any, workspaces: any): HTMLButtonElement {
+function mountPill(row: HTMLElement, onStart: () => Promise<void>): HTMLButtonElement {
   const btn = document.createElement('button')
   btn.type = 'button'
   btn.setAttribute('data-temp-cwd', '')
@@ -357,7 +331,7 @@ function mountPill(row: HTMLElement, sessions: any, workspaces: any): HTMLButton
     busy = true
     window.clearTimeout(revertTimer)
     setBusy()
-    createTempSession(sessions, workspaces)
+    onStart()
       .catch((err: unknown) => {
         console.error('[temp-cwd] failed to open temp session:', err)
         const message = err instanceof Error ? err.message : String(err)

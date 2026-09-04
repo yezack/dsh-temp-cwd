@@ -13,41 +13,48 @@ the blank / ungrouped state. Clicking the pill:
    switches away) — the folder and session record stay, and the session
    falls into 「未分组」 (ungrouped) automatically.
 
-All official dsh APIs. The only DOM touch is appending one plain
-`<button>` into the hero chip row; the official 「选择工作区」 chip and its
+All flow APIs are official dsh client APIs. The only DOM touch is appending one
+plain `<button>` into the hero chip row; the official 「选择工作区」 chip and its
 picker are never modified — clicking it still opens the native workspace
 picker exactly as before.
 
-## How the pill gets there (v10)
+## How the pill gets there (v11)
 
 The chip row (`heroWorkspaceRow`, hardcoded JSX in ui-conversation) has **no
 injectable seat** — both hero seats (`conversation.hero.workspace` /
-`agentPreset`) are single/root and claimed at priority 0 by official
-packages, so a pure-slot button cannot coexist there (v7 was shadowed, v8
-shadowed the official picker and broke 「选择工作区」, v9 retreated to the
-sidebar footer but was effectively invisible to the user). v10 therefore
-works at the DOM level instead:
+`conversation.hero.agentPreset`) are single/root and claimed at priority 0 by
+official packages, so a pure-slot button cannot coexist there (v7 was
+shadowed, v8 shadowed the official picker and broke 「选择工作区」, v9 retreated
+to the sidebar footer but was effectively invisible to the user). The pill
+therefore works at the DOM level:
 
 - a **headless host** (renders nothing) registers on the
-  `sidebar.footer.action` list seat — purely for lifecycle management;
+  `sidebar.footer.action` LIST seat (id `temp-cwd`) — purely for lifecycle;
 - it finds the row with `[class*="heroWorkspaceRow"]` (the CSS-module class
   keeps the readable `heroWorkspaceRow` suffix across hash changes) and
   imperatively appends a plain `<button data-temp-cwd>` (CSS `order: 2`,
   so it always sits right after the official chip — steady state visual:
   `[选择工作区 ▾][开始临时对话]`);
 - the pill is chip-styled with the host's own tokens (radius 16 / min-height
-  28 / 13px 500 / label-primary / hover bg) and uses **zero react-dom** —
-  the host renders no React into the row, and the pill lifecycle is pure
-  DOM (`mountPill` / `removePill`);
-- store-driven rescan (`useSyncExternalStore` over workspaces + session
-  list) re-locates the row on blank↔active transitions, plus a 1.2 s
-  interval self-heal re-appends the pill if React reconciliation ever
-  disturbs it.
+  28 / 13px 500 / label-primary / hover bg) and uses **zero react-dom**;
+- **store consumption is official**: the host component reads the workspace /
+  session models through the slot renderer's inject-`hooks` compartment
+  (`workspaceList: ctx.workspaces.list`, `sessionList: ctx.sessions.list`),
+  which surfaces them as `useWorkspaceList` / `useSessionList` selector props.
+  v10 crashed with `workspaces.getSnapshot is not a function` because it
+  called `subscribe`/`getSnapshot` on the *controller* — those live on the
+  model exposed as `ctx.workspaces.list`. The pill component never touches
+  controllers or `useSyncExternalStore` itself;
+- a store-driven rescan re-locates the row on blank↔active transitions, plus
+  a 1.2 s interval self-heal re-appends the pill if React reconciliation
+  ever disturbs the appended foreign child.
 
 Visibility: the pill mounts only while the row exists **and** the current
-session is not attached to any workspace. Since the row itself unmounts once
-a session binds a workspace, the pill disappears with it — and comes back
-when you return to an ungrouped/blank conversation.
+session is not attached to any workspace (`workspace.sessionIds` lookup — the
+same binding check the official ui-workspace / ui-conversation code uses).
+Since the row itself unmounts once a session binds a workspace, the pill
+disappears with it — and comes back when you return to an ungrouped/blank
+conversation.
 
 ## Install
 
@@ -74,18 +81,18 @@ rootDirectory: 'D:/scratch/dsh-temp'
   (path-traversal guarded).
 - `src/client.ts` — browser half: headless host on `sidebar.footer.action`
   (renders nothing) + pure-DOM pill appended into the official
-  `heroWorkspaceRow`. Click flow: mkdir → `workspaces.create` →
-  `sessions.create({ workspaceId })` → `sessions.open` → cleanup after
-  first message / switch away. Also patches `uiWorkspace.startSession` so an
-  un-argued "new session" never re-attaches the current workspace
-  (Bug A fix).
+  `heroWorkspaceRow`, driven by official inject-`hooks` store props.
+  Click flow: mkdir → `workspaces.create` → `sessions.create({ workspaceId })`
+  → `sessions.open` → cleanup after first message / switch away. Also patches
+  `uiWorkspace.startSession` so an un-argued "new session" never re-attaches
+  the current workspace (Bug A fix).
 
 ## Build
 
 ```bash
 npm install
 npm run build   # esbuild → dist/index.js + dist/client.js (charset utf8)
-npm run verify  # scripts/verify-client.cjs — 21 string-level contract checks
+npm run verify  # scripts/verify-client.cjs — 23 string-level contract checks
 ```
 
 The `dist/` artifacts are committed so `dsh plugin add github:...` works

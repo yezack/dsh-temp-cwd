@@ -16,34 +16,37 @@ const checks = [
   ['inject sessions', () => code.includes('sessions')],
   ['apply exported', () => /function apply\(ctx\)/.test(code) && code.includes('apply: () => apply')],
   ['slots.inject usage', () => code.includes('slots.inject')],
-  ['sidebar.footer.action seat + temp-cwd id (headless host, v10)', () =>
+  ['sidebar.footer.action seat + temp-cwd id (headless host)', () =>
     /slots\.inject\(\s*["']sidebar\.footer\.action["']/.test(code) &&
     /id:\s*["']temp-cwd["']/.test(code)],
   ['workspaces.create + delete', () => code.includes('workspaces.create({ path })') && code.includes('workspaces.delete(workspace.workspaceId)')],
   ['sessions.create workspaceId', () => code.includes('sessions.create({ workspaceId: workspace.workspaceId })')],
-  ['blank-first-message cleanup (v6)', () => code.includes('sessions.list.subscribe') && code.includes('entry.blank === false') && code.includes('snap.current !== sessionId')],
+  ['blank-first-message cleanup', () => code.includes('sessions.list.subscribe') && code.includes('entry.blank === false') && code.includes('snap.current !== sessionId')],
   ['startSession wrapper', () => code.includes('startSession = (workspaceId) => {') && code.includes('sessions.clear()')],
-  ['no hero seat shadowing (v9)', () =>
+  ['no hero seat shadowing', () =>
     !/slots\.inject\(["']conversation\.hero/.test(code) &&
     !code.includes('priority: -1') &&
     !code.includes('__reactFiber$') &&
     !code.includes('MutationObserver') &&
     !code.includes('setRootElement')],
-  ['reactive stores via useSyncExternalStore', () =>
-    code.includes('useSyncExternalStore') &&
-    code.includes('workspaces.subscribe') &&
-    code.includes('sessionsList.subscribe') &&
-    code.includes('sessionIds.includes')],
-  ['zero react-dom (v10 pure-DOM pill)', () =>
+  ['official store consumption via inject hooks compartment (v11)', () =>
+    code.includes('workspaceList: workspaces.list') &&
+    code.includes('sessionList: sessions.list')],
+  ['renderer-bound selector props; no direct useSyncExternalStore (v11)', () =>
+    code.includes('useWorkspaceList') &&
+    code.includes('useSessionList') &&
+    !code.includes('useSyncExternalStore')],
+  ['sessionIds binding check (official ui lookup)', () => code.includes('sessionIds.includes')],
+  ['zero react-dom (pure-DOM pill)', () =>
     !code.includes('react-dom') &&
     !code.includes('createPortal')],
-  ['hero row finder (v10)', () => code.includes('[class*="heroWorkspaceRow"]')],
-  ['imperative pill mount (v10)', () =>
+  ['hero row finder', () => code.includes('[class*="heroWorkspaceRow"]')],
+  ['imperative pill mount', () =>
     code.includes('data-temp-cwd') &&
     code.includes('mountPill') &&
     code.includes('ensurePillStyle') &&
     code.includes('开始临时对话')],
-  ['row self-heal interval (v10)', () =>
+  ['row self-heal interval', () =>
     code.includes('setInterval') &&
     code.includes('el.contains(pill)')],
 ]

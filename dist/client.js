@@ -75,12 +75,13 @@ function apply(ctx) {
         name: "sidebar.footer.action",
         id: "temp-cwd",
         inject: () => ({
-          /** Official session controller: create({ workspaceId }) / open(id). */
-          sessions,
-          /** Official workspace controller: create({ path }) / delete(id). */
-          workspaces,
-          /** Session list projection model: subscribe / getSnapshot (items carry `blank`). */
-          sessionsList: sessions.list
+          hooks: {
+            /** Workspace model: subscribe/getSnapshot → { items, phase, … }. */
+            workspaceList: workspaces.list,
+            /** Session list model: subscribe/getSnapshot → { items, current, … }. */
+            sessionList: sessions.list
+          },
+          onStartTemp: () => createTempSession(sessions, workspaces)
         })
       },
       TempCwdHost
@@ -121,32 +122,25 @@ function armCleanup(sessions, workspaces, workspaceId, sessionId) {
   });
 }
 function TempCwdHost(props) {
-  const { sessions, workspaces, sessionsList } = props;
-  const wsSnap = React.useSyncExternalStore(
-    (listener) => workspaces.subscribe(listener),
-    () => workspaces.getSnapshot()
-  );
-  const sesSnap = React.useSyncExternalStore(
-    (listener) => sessionsList.subscribe(listener),
-    () => sessionsList.getSnapshot()
-  );
+  const { useWorkspaceList, useSessionList, onStartTemp } = props;
+  const wsItems = useWorkspaceList((snapshot) => snapshot.items);
+  const currentSessionId = useSessionList((snapshot) => snapshot.current);
+  const bound = currentSessionId !== void 0 && wsItems.some((w) => w.sessionIds.includes(currentSessionId));
   const [row, setRow] = React.useState(null);
   const pillRef = React.useRef(null);
   const rowRef = React.useRef(null);
   const boundRef = React.useRef(false);
-  const currentSessionId = sesSnap.current;
-  const boundWorkspace = currentSessionId === void 0 ? void 0 : wsSnap.items.find((w) => w.sessionIds.includes(currentSessionId));
   rowRef.current = row;
-  boundRef.current = boundWorkspace !== void 0;
+  boundRef.current = bound;
   React.useEffect(() => {
     setRow(findHeroRow());
-  }, [currentSessionId, boundWorkspace?.workspaceId]);
+  }, [currentSessionId, bound]);
   React.useEffect(() => {
     removePill(pillRef);
-    if (row === null || boundWorkspace !== void 0) return;
-    pillRef.current = mountPill(row, sessions, workspaces);
+    if (row === null || bound) return;
+    pillRef.current = mountPill(row, onStartTemp);
     return () => removePill(pillRef);
-  }, [row, boundWorkspace?.workspaceId, sessions, workspaces]);
+  }, [row, bound, onStartTemp]);
   React.useEffect(() => {
     const id = window.setInterval(() => {
       const el = findHeroRow();
@@ -158,7 +152,7 @@ function TempCwdHost(props) {
       const shouldMount = el !== null && !boundRef.current;
       if (shouldMount && (pill === null || !el.contains(pill))) {
         removePill(pillRef);
-        pillRef.current = mountPill(el, sessions, workspaces);
+        pillRef.current = mountPill(el, onStartTemp);
       } else if (!shouldMount && pill !== null) {
         removePill(pillRef);
       }
@@ -195,7 +189,7 @@ function removePill(pillRef) {
   pillRef.current = null;
   if (pill !== null && pill.isConnected) pill.remove();
 }
-function mountPill(row, sessions, workspaces) {
+function mountPill(row, onStart) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.setAttribute("data-temp-cwd", "");
@@ -233,7 +227,7 @@ function mountPill(row, sessions, workspaces) {
     busy = true;
     window.clearTimeout(revertTimer);
     setBusy();
-    createTempSession(sessions, workspaces).catch((err) => {
+    onStart().catch((err) => {
       console.error("[temp-cwd] failed to open temp session:", err);
       const message = err instanceof Error ? err.message : String(err);
       showError(message);
