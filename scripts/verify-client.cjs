@@ -34,11 +34,12 @@ const checks = [
     code.includes('hostRegister') &&
     code.includes('hostFinalize') &&
     code.includes('hostAbandon')],
-  ['no client-side workspace/session mutations (host owns cleanup)', () =>
+  ['no client-side workspace delete (host temp cleanup); batch archive ok (v15)', () =>
     !code.includes('workspaces.delete(') &&
-    !code.includes('workspaces.archiveSession(') &&
     !code.includes('hostRemoveDir') &&
-    !code.includes('remove-dir?p=')],
+    !code.includes('remove-dir?p=') &&
+    code.includes('workspaces.archiveSession(sessionId)') &&
+    code.includes('deleteSession')],
   ['tempPending tracks path + sessionId', () =>
     code.includes('tempPending') &&
     /\btempPending = \{ path, sessionId \}/.test(code)],
