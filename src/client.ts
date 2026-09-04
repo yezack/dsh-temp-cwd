@@ -131,13 +131,12 @@ export function apply(ctx: any): void {
           onResumeArmCleanup: (workspaceId: string, path: string, sessionId: string) => {
             armCleanup(sessions, workspaces, workspaceId, path, sessionId)
           },
-          /** Sweep a leftover temp workspace that has no sessions at all. */
-          onForgetOrphan: (workspaceId: string, path: string) => {
-            hostRemoveDir(path)
-            workspaces.delete(workspaceId).catch((err: any) => {
-              console.warn('[temp-cwd] orphan workspace delete failed:', err)
-            })
-          },
+          /**
+           * Purge one stale temp workspace: archive every remaining session
+           * (so no lonely rows can appear), remove the folder (marker), then
+           * delete the workspace.
+           */
+          onPurgeStale: (workspace: any) => purgeTempWorkspace(workspaces, workspace),
         }),
       },
       TempCwdHost,
@@ -173,6 +172,11 @@ async function renameTempWorkspace(workspaces: any, workspaceId: string): Promis
  * The host mkdir route creates the folder AND the .TEMP_WORKSPACE marker.
  */
 async function createTempSession(sessions: any, workspaces: any): Promise<void> {
+  // 0. Clean up leftovers first: any stale 临时会话… workspace from an
+  //    interrupted run is fully purged (sessions archived, folder removed,
+  //    workspace deleted) BEFORE we scaffold a new one.
+  await purgeStaleBeforeCreate(sessions, workspaces)
+
   // 1. Ask the host for a fresh timestamped temp directory (+ marker).
   const res = await fetch('/api/temp-cwd/mkdir', { method: 'POST' })
   if (!res.ok) throw new Error(`mkdir failed: ${res.status}`)
@@ -241,6 +245,54 @@ async function hostRemoveMarker(path: string): Promise<void> {
 }
 
 /**
+ * Fully purge one stale temp workspace (leftover from an interrupted run):
+ * archive every session it still holds (the host's "remove from the active
+ * list" operation — otherwise the session would fall into 未分组 and show),
+ * remove the temp folder (marker authorizes it), then delete the workspace.
+ */
+async function purgeTempWorkspace(workspaces: any, workspace: any): Promise<void> {
+  const sessionIds = Array.isArray(workspace?.sessionIds) ? workspace.sessionIds : []
+  for (const sessionId of sessionIds) {
+    try {
+      await workspaces.archiveSession(sessionId)
+    } catch (err) {
+      console.warn('[temp-cwd] purge: archive session failed (ignored):', err)
+    }
+  }
+  await hostRemoveDir(workspace?.path)
+  try {
+    await workspaces.delete(workspace.workspaceId)
+    console.info('[temp-cwd] purged stale temp workspace', workspace.workspaceId)
+  } catch (err) {
+    console.warn('[temp-cwd] purge: workspace delete failed:', err)
+  }
+}
+
+/**
+ * Before creating a NEW temp session, purge every stale temp workspace
+ * (title 「临时会话…») that is not the current session's workspace — so the
+ * user never accumulates leftover 临时会话 / 临时会话 2 rows, and the base
+ * name is free again.
+ */
+async function purgeStaleBeforeCreate(sessions: any, workspaces: any): Promise<void> {
+  const wsSnap = workspaces.list.getSnapshot()
+  const sesSnap = sessions.list.getSnapshot()
+  const items = Array.isArray(wsSnap?.items) ? wsSnap.items : []
+  const current = sesSnap?.current
+  const stale = items.filter(
+    (w: any) =>
+      isTempTitle(w.title) &&
+      !(current !== undefined && Array.isArray(w.sessionIds) && w.sessionIds.includes(current)),
+  )
+  if (stale.length === 0) return
+  console.info('[temp-cwd] purging stale temp workspace(s) before create:', stale.length)
+  for (const w of stale) {
+    sweptOrphans.add(w.workspaceId)
+    await purgeTempWorkspace(workspaces, w)
+  }
+}
+
+/**
  * Subscribe to the session list model and finalize the temp workspace at the
  * first moment it is safe:
  *   - first message (`byId[sessionId].blank === false`): real session —
@@ -256,6 +308,39 @@ function armCleanup(
   sessionId: string,
 ): void {
   let done = false
+  let abandonCandidate = false
+  let abandonTimer = 0
+  let reopenedOnce = false
+
+  const finalizeAbandon = () => {
+    if (done) return
+    done = true
+    dispose()
+    const pending = tempPending
+    if (pending !== null && pending.workspaceId === workspaceId) tempPending = null
+    // Abandoned BEFORE the first message: nothing of it may remain visible in
+    // the sidebar. Remove the whole temp folder (marker authorizes it),
+    // archive the still-blank session (workspace deletion alone would drop it
+    // into 未分组 and leave the "lonely temp conversation" row), then delete
+    // the workspace.
+    console.info('[temp-cwd] abandoned — removing folder + archiving session', path)
+    void hostRemoveDir(path)
+      .then(() => workspaces.archiveSession(sessionId))
+      .then(
+        () => {
+          console.info('[temp-cwd] archived session; deleting workspace', workspaceId)
+          return workspaces.delete(workspaceId)
+        },
+        (err: any) => {
+          console.warn('[temp-cwd] archive failed, deleting workspace anyway:', err)
+          return workspaces.delete(workspaceId)
+        },
+      )
+      .catch((err: any) => {
+        console.warn('[temp-cwd] abandon cleanup failed:', err)
+      })
+  }
+
   const dispose = sessions.list.subscribe(() => {
     if (done) return
     const snap = sessions.list.getSnapshot()
@@ -266,41 +351,65 @@ function armCleanup(
     const byId = snap?.byId !== void 0 && snap.byId !== null ? snap.byId : {}
     const entry = byId[sessionId]
     const firstMessage = entry !== undefined && entry.blank === false
-    const abandoned = snap?.current !== sessionId
-    if (!firstMessage && !abandoned) return
-
-    done = true
-    dispose()
-    const pending = tempPending
-    if (pending !== null && pending.workspaceId === workspaceId) tempPending = null
-
-    // Finalize the folder first, then remove the sidebar workspace entry.
     if (firstMessage) {
+      done = true
+      dispose()
+      window.clearTimeout(abandonTimer)
+      const pending = tempPending
+      if (pending !== null && pending.workspaceId === workspaceId) tempPending = null
+      // First message — the session is real: keep the folder (remove the
+      // marker) and delete the workspace; the session moves to 未分组.
       console.info('[temp-cwd] first message — keeping folder, removing marker', path)
-      void hostRemoveMarker(path).then(() => {
-        console.info('[temp-cwd] marker removed; deleting workspace', workspaceId)
-        return workspaces.delete(workspaceId)
-      })
-    } else {
-      // Abandoned BEFORE the first message: nothing of it may remain visible
-      // in the sidebar. Remove the whole temp folder (marker authorizes it),
-      // archive the still-blank session (workspace deletion alone would drop
-      // it into 未分组 and leave the "lonely temp conversation" row), then
-      // delete the workspace.
-      console.info('[temp-cwd] abandoned — removing folder + archiving session', path)
-      void hostRemoveDir(path)
-        .then(() => workspaces.archiveSession(sessionId))
-        .then(
-          () => {
-            console.info('[temp-cwd] archived session; deleting workspace', workspaceId)
-            return workspaces.delete(workspaceId)
-          },
-          (err: any) => {
-            console.warn('[temp-cwd] archive failed, deleting workspace anyway:', err)
-            return workspaces.delete(workspaceId)
-          },
-        )
+      void hostRemoveMarker(path)
+        .then(() => {
+          console.info('[temp-cwd] marker removed; deleting workspace', workspaceId)
+          return workspaces.delete(workspaceId)
+        })
+        .catch((err: any) => {
+          console.warn('[temp-cwd] first-message cleanup failed:', err)
+        })
+      return
     }
+
+    // Abandon candidate: the current session moved away. Host-side
+    // "restore recent workspace" logic can steal the selection a few hundred
+    // ms after we open the temp session, so don't finalize immediately —
+    // wait out a grace window, and if we were only left in the no-session
+    // hero state, reopen our temp session once.
+    const abandoned = snap?.current !== sessionId
+    if (!abandoned) {
+      abandonCandidate = false
+      window.clearTimeout(abandonTimer)
+      return
+    }
+    if (abandonCandidate) return
+    abandonCandidate = true
+    abandonTimer = window.setTimeout(() => {
+      const snap2 = sessions.list.getSnapshot()
+      const current2 = snap2?.current
+      if (done) return
+      if (current2 === sessionId) {
+        // Selection came back — still active.
+        abandonCandidate = false
+        return
+      }
+      if (current2 === undefined && !reopenedOnce && tempPending !== null) {
+        // Nobody is selected (hero): the host watcher dropped our selection
+        // without choosing another session — reopen the temp session once.
+        // NOTE: sessions.open(id) is SYNCHRONOUS (returns void), not a
+        // promise — calling .catch() on it would throw.
+        reopenedOnce = true
+        abandonCandidate = false
+        console.info('[temp-cwd] reopening temp session after watcher stole selection')
+        try {
+          sessions.open(sessionId)
+        } catch (err) {
+          console.warn('[temp-cwd] reopen failed:', err)
+        }
+        return
+      }
+      finalizeAbandon()
+    }, 2000)
   })
 }
 
@@ -319,10 +428,10 @@ function TempCwdHost(props: {
   onStartTemp: () => Promise<void>
   /** Re-arm cleanup for a temp workspace resumed after a reload. */
   onResumeArmCleanup: (workspaceId: string, path: string, sessionId: string) => void
-  /** Sweep a leftover temp workspace that has no sessions at all. */
-  onForgetOrphan: (workspaceId: string, path: string) => void
+  /** Purge one stale temp workspace (archive sessions, remove dir, delete). */
+  onPurgeStale: (workspace: any) => Promise<void>
 }) {
-  const { useWorkspaceList, useSessionList, onStartTemp, onResumeArmCleanup, onForgetOrphan } = props
+  const { useWorkspaceList, useSessionList, onStartTemp, onResumeArmCleanup, onPurgeStale } = props
 
   // Workspace items (reference-stable between invalidations) — each carries
   // `sessionIds`; the official ui-conversation / ui-workspace code resolves
@@ -411,20 +520,26 @@ function TempCwdHost(props: {
     onResumeArmCleanup(resumed.workspaceId, resumed.path, currentSessionId)
   }, [wsItems, sessionById, currentSessionId, onResumeArmCleanup])
 
-  // Sweep: temp workspaces left behind by interrupted runs (no sessions at
-  // all) never show in the list and are removed on the next load. Never
-  // sweep while a temp workspace is being created (it has no session yet for
-  // a brief moment) and remember swept ids so store churn cannot double-fire.
+  // Purge: temp workspaces left behind by interrupted runs (anything not
+  // currently open) are fully removed on the next load — sessions archived,
+  // folder removed, workspace deleted. Never purge while a temp workspace is
+  // being created and never touch the current session's workspace; remember
+  // purged ids so store churn cannot double-fire.
   React.useEffect(() => {
     if (tempPending !== null) return
     for (const w of wsItems) {
       if (!isTempTitle(w.title)) continue
       const sessionsInside = Array.isArray(w.sessionIds) ? w.sessionIds : []
-      if (sessionsInside.length > 0) continue
+      if (
+        currentSessionId !== undefined &&
+        sessionsInside.includes(currentSessionId)
+      ) {
+        continue
+      }
       if (sweptOrphans.has(w.workspaceId)) continue
       sweptOrphans.add(w.workspaceId)
-      console.info('[temp-cwd] sweeping session-less temp workspace', w.workspaceId)
-      onForgetOrphan(w.workspaceId, w.path)
+      console.info('[temp-cwd] purging stale temp workspace on load', w.workspaceId)
+      void onPurgeStale(w)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wsItems])

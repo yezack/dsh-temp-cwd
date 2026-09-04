@@ -91,13 +91,12 @@ function apply(ctx) {
           onResumeArmCleanup: (workspaceId, path, sessionId) => {
             armCleanup(sessions, workspaces, workspaceId, path, sessionId);
           },
-          /** Sweep a leftover temp workspace that has no sessions at all. */
-          onForgetOrphan: (workspaceId, path) => {
-            hostRemoveDir(path);
-            workspaces.delete(workspaceId).catch((err) => {
-              console.warn("[temp-cwd] orphan workspace delete failed:", err);
-            });
-          }
+          /**
+           * Purge one stale temp workspace: archive every remaining session
+           * (so no lonely rows can appear), remove the folder (marker), then
+           * delete the workspace.
+           */
+          onPurgeStale: (workspace) => purgeTempWorkspace(workspaces, workspace)
         })
       },
       TempCwdHost
@@ -121,6 +120,7 @@ async function renameTempWorkspace(workspaces, workspaceId) {
   console.warn("[temp-cwd] rename to 临时会话 failed: too many name conflicts");
 }
 async function createTempSession(sessions, workspaces) {
+  await purgeStaleBeforeCreate(sessions, workspaces);
   const res = await fetch("/api/temp-cwd/mkdir", { method: "POST" });
   if (!res.ok) throw new Error(`mkdir failed: ${res.status}`);
   const { path } = await res.json();
@@ -165,43 +165,117 @@ async function hostRemoveMarker(path) {
     console.warn("[temp-cwd] remove-marker request failed:", err);
   }
 }
+async function purgeTempWorkspace(workspaces, workspace) {
+  const sessionIds = Array.isArray(workspace?.sessionIds) ? workspace.sessionIds : [];
+  for (const sessionId of sessionIds) {
+    try {
+      await workspaces.archiveSession(sessionId);
+    } catch (err) {
+      console.warn("[temp-cwd] purge: archive session failed (ignored):", err);
+    }
+  }
+  await hostRemoveDir(workspace?.path);
+  try {
+    await workspaces.delete(workspace.workspaceId);
+    console.info("[temp-cwd] purged stale temp workspace", workspace.workspaceId);
+  } catch (err) {
+    console.warn("[temp-cwd] purge: workspace delete failed:", err);
+  }
+}
+async function purgeStaleBeforeCreate(sessions, workspaces) {
+  const wsSnap = workspaces.list.getSnapshot();
+  const sesSnap = sessions.list.getSnapshot();
+  const items = Array.isArray(wsSnap?.items) ? wsSnap.items : [];
+  const current = sesSnap?.current;
+  const stale = items.filter(
+    (w) => isTempTitle(w.title) && !(current !== void 0 && Array.isArray(w.sessionIds) && w.sessionIds.includes(current))
+  );
+  if (stale.length === 0) return;
+  console.info("[temp-cwd] purging stale temp workspace(s) before create:", stale.length);
+  for (const w of stale) {
+    sweptOrphans.add(w.workspaceId);
+    await purgeTempWorkspace(workspaces, w);
+  }
+}
 function armCleanup(sessions, workspaces, workspaceId, path, sessionId) {
   let done = false;
+  let abandonCandidate = false;
+  let abandonTimer = 0;
+  let reopenedOnce = false;
+  const finalizeAbandon = () => {
+    if (done) return;
+    done = true;
+    dispose();
+    const pending = tempPending;
+    if (pending !== null && pending.workspaceId === workspaceId) tempPending = null;
+    console.info("[temp-cwd] abandoned — removing folder + archiving session", path);
+    void hostRemoveDir(path).then(() => workspaces.archiveSession(sessionId)).then(
+      () => {
+        console.info("[temp-cwd] archived session; deleting workspace", workspaceId);
+        return workspaces.delete(workspaceId);
+      },
+      (err) => {
+        console.warn("[temp-cwd] archive failed, deleting workspace anyway:", err);
+        return workspaces.delete(workspaceId);
+      }
+    ).catch((err) => {
+      console.warn("[temp-cwd] abandon cleanup failed:", err);
+    });
+  };
   const dispose = sessions.list.subscribe(() => {
     if (done) return;
     const snap = sessions.list.getSnapshot();
     const byId = snap?.byId !== void 0 && snap.byId !== null ? snap.byId : {};
     const entry = byId[sessionId];
     const firstMessage = entry !== void 0 && entry.blank === false;
-    const abandoned = snap?.current !== sessionId;
-    if (!firstMessage && !abandoned) return;
-    done = true;
-    dispose();
-    const pending = tempPending;
-    if (pending !== null && pending.workspaceId === workspaceId) tempPending = null;
     if (firstMessage) {
+      done = true;
+      dispose();
+      window.clearTimeout(abandonTimer);
+      const pending = tempPending;
+      if (pending !== null && pending.workspaceId === workspaceId) tempPending = null;
       console.info("[temp-cwd] first message — keeping folder, removing marker", path);
       void hostRemoveMarker(path).then(() => {
         console.info("[temp-cwd] marker removed; deleting workspace", workspaceId);
         return workspaces.delete(workspaceId);
+      }).catch((err) => {
+        console.warn("[temp-cwd] first-message cleanup failed:", err);
       });
-    } else {
-      console.info("[temp-cwd] abandoned — removing folder + archiving session", path);
-      void hostRemoveDir(path).then(() => workspaces.archiveSession(sessionId)).then(
-        () => {
-          console.info("[temp-cwd] archived session; deleting workspace", workspaceId);
-          return workspaces.delete(workspaceId);
-        },
-        (err) => {
-          console.warn("[temp-cwd] archive failed, deleting workspace anyway:", err);
-          return workspaces.delete(workspaceId);
-        }
-      );
+      return;
     }
+    const abandoned = snap?.current !== sessionId;
+    if (!abandoned) {
+      abandonCandidate = false;
+      window.clearTimeout(abandonTimer);
+      return;
+    }
+    if (abandonCandidate) return;
+    abandonCandidate = true;
+    abandonTimer = window.setTimeout(() => {
+      const snap2 = sessions.list.getSnapshot();
+      const current2 = snap2?.current;
+      if (done) return;
+      if (current2 === sessionId) {
+        abandonCandidate = false;
+        return;
+      }
+      if (current2 === void 0 && !reopenedOnce && tempPending !== null) {
+        reopenedOnce = true;
+        abandonCandidate = false;
+        console.info("[temp-cwd] reopening temp session after watcher stole selection");
+        try {
+          sessions.open(sessionId);
+        } catch (err) {
+          console.warn("[temp-cwd] reopen failed:", err);
+        }
+        return;
+      }
+      finalizeAbandon();
+    }, 2e3);
   });
 }
 function TempCwdHost(props) {
-  const { useWorkspaceList, useSessionList, onStartTemp, onResumeArmCleanup, onForgetOrphan } = props;
+  const { useWorkspaceList, useSessionList, onStartTemp, onResumeArmCleanup, onPurgeStale } = props;
   const wsItems = useWorkspaceList(
     (snapshot) => Array.isArray(snapshot?.items) ? snapshot.items : EMPTY_ITEMS
   );
@@ -255,11 +329,13 @@ function TempCwdHost(props) {
     for (const w of wsItems) {
       if (!isTempTitle(w.title)) continue;
       const sessionsInside = Array.isArray(w.sessionIds) ? w.sessionIds : [];
-      if (sessionsInside.length > 0) continue;
+      if (currentSessionId !== void 0 && sessionsInside.includes(currentSessionId)) {
+        continue;
+      }
       if (sweptOrphans.has(w.workspaceId)) continue;
       sweptOrphans.add(w.workspaceId);
-      console.info("[temp-cwd] sweeping session-less temp workspace", w.workspaceId);
-      onForgetOrphan(w.workspaceId, w.path);
+      console.info("[temp-cwd] purging stale temp workspace on load", w.workspaceId);
+      void onPurgeStale(w);
     }
   }, [wsItems]);
   React.useEffect(() => {

@@ -60,10 +60,11 @@ const checks = [
     code.includes('tempcwdHidden') &&
     code.includes('projectRow') &&
     code.includes('sessionRow')],
-  ['reload resilience + orphan sweep (v13.2)', () =>
+  ['reload resilience + stale purge (v13.5)', () =>
     code.includes('onResumeArmCleanup') &&
-    code.includes('onForgetOrphan') &&
-    code.includes('tempRowRegion')],
+    code.includes('onPurgeStale') &&
+    code.includes('tempRowRegion') &&
+    code.includes('purgeStaleBeforeCreate')],
   ['zero react-dom (pure-DOM pill)', () =>
     !code.includes('react-dom') &&
     !code.includes('createPortal')],
