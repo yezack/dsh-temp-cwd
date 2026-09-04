@@ -37,11 +37,17 @@ const checks = [
     code.includes('useSessionList') &&
     !code.includes('useSyncExternalStore')],
   ['sessionIds binding check (official ui lookup)', () => code.includes('sessionIds.includes')],
-  ['marker lifecycle host endpoints (v12)', () =>
+  ['marker lifecycle host endpoints (v12+)', () =>
     code.includes('/api/temp-cwd/remove-dir?p=') &&
     code.includes('/api/temp-cwd/remove-marker?p=') &&
+    code.includes('/api/temp-cwd/info?p=') &&
     code.includes('hostRemoveDir') &&
-    code.includes('hostRemoveMarker')],
+    code.includes('hostRemoveMarker') &&
+    code.includes('hostMarkerInfo')],
+  ['purge age gate + no auto-reopen (v13.7)', () =>
+    code.includes('PURGE_AGE_MS') &&
+    code.includes('Date.now() - info.mtimeMs') &&
+    !code.includes('reopening temp session')],
   ['tempPending state (workspaceId + path)', () =>
     code.includes('tempPending') &&
     code.includes('workspaceId: workspace.workspaceId, path')],

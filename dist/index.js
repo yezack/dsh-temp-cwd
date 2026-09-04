@@ -103,6 +103,31 @@ function apply(ctx, config) {
     }),
     "temp-cwd: remove-marker route"
   );
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: "exact",
+      path: "/api/temp-cwd/info",
+      handler: (req, res) => {
+        const dir = pathParam(req);
+        if (dir === null || !isTempDir(root, dir)) {
+          json(res, 400, { error: "invalid path" });
+          return;
+        }
+        const marker = join(dir, MARKER_FILE);
+        try {
+          const stat = statSync(marker);
+          if (!stat.isFile()) {
+            json(res, 200, { hasMarker: false, mtimeMs: 0 });
+            return;
+          }
+          json(res, 200, { hasMarker: true, mtimeMs: stat.mtimeMs });
+        } catch {
+          json(res, 200, { hasMarker: false, mtimeMs: 0 });
+        }
+      }
+    }),
+    "temp-cwd: info route"
+  );
 }
 export {
   Config,

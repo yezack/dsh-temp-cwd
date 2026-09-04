@@ -165,4 +165,33 @@ export function apply(ctx: any, config: any): void {
     }),
     'temp-cwd: remove-marker route',
   )
+
+  // Read the marker's age. Used by sweep/purge decisions so a fresh temp
+  // workspace still in use by ANOTHER window is never mistaken for a stale
+  // leftover: only markers older than the purge threshold qualify.
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: '/api/temp-cwd/info',
+      handler: (req: any, res: any) => {
+        const dir = pathParam(req)
+        if (dir === null || !isTempDir(root, dir)) {
+          json(res, 400, { error: 'invalid path' })
+          return
+        }
+        const marker = join(dir, MARKER_FILE)
+        try {
+          const stat = statSync(marker)
+          if (!stat.isFile()) {
+            json(res, 200, { hasMarker: false, mtimeMs: 0 })
+            return
+          }
+          json(res, 200, { hasMarker: true, mtimeMs: stat.mtimeMs })
+        } catch {
+          json(res, 200, { hasMarker: false, mtimeMs: 0 })
+        }
+      },
+    }),
+    'temp-cwd: info route',
+  )
 }

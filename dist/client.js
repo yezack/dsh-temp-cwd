@@ -168,6 +168,18 @@ async function hostRemoveMarker(path) {
     console.warn("[temp-cwd] remove-marker request failed:", err);
   }
 }
+async function hostMarkerInfo(path) {
+  try {
+    const res = await fetch(`/api/temp-cwd/info?p=${encodeURIComponent(path)}`, {
+      method: "POST"
+    });
+    if (!res.ok) return { hasMarker: false, mtimeMs: 0 };
+    return await res.json();
+  } catch {
+    return { hasMarker: false, mtimeMs: 0 };
+  }
+}
+var PURGE_AGE_MS = 2e4;
 async function purgeTempWorkspace(workspaces, workspace) {
   const sessionIds = Array.isArray(workspace?.sessionIds) ? workspace.sessionIds : [];
   for (const sessionId of sessionIds) {
@@ -192,13 +204,20 @@ async function purgeStaleBeforeCreate(sessions, workspaces) {
   const sesSnap = sessions.list.getSnapshot();
   const items = Array.isArray(wsSnap?.items) ? wsSnap.items : [];
   const current = sesSnap?.current;
-  const stale = items.filter(
+  const candidates = items.filter(
     (w) => isTempTitle(w.title) && !(current !== void 0 && Array.isArray(w.sessionIds) && w.sessionIds.includes(current))
   );
-  if (stale.length === 0) return;
-  console.info("[temp-cwd] purging stale temp workspace(s) before create:", stale.length);
-  for (const w of stale) {
+  if (candidates.length === 0) return;
+  console.info(
+    "[temp-cwd] checking stale temp workspace(s) before create:",
+    candidates.length
+  );
+  for (const w of candidates) {
+    const info = await hostMarkerInfo(w.path);
+    const stale = info.hasMarker && Date.now() - info.mtimeMs >= PURGE_AGE_MS;
+    if (!stale) continue;
     sweptOrphans.add(w.workspaceId);
+    console.info("[temp-cwd] purging stale temp workspace (marker age ok)", w.workspaceId);
     await purgeTempWorkspace(workspaces, w);
   }
 }
@@ -206,7 +225,6 @@ function armCleanup(sessions, workspaces, workspaceId, path, sessionId) {
   let done = false;
   let abandonCandidate = false;
   let abandonTimer = 0;
-  let reopenedOnce = false;
   const finalizeAbandon = () => {
     if (done) return;
     done = true;
@@ -264,26 +282,15 @@ function armCleanup(sessions, workspaces, workspaceId, path, sessionId) {
     if (abandonCandidate) return;
     abandonCandidate = true;
     abandonTimer = window.setTimeout(() => {
+      if (done) return;
       const snap2 = sessions.list.getSnapshot();
       const current2 = snap2?.current;
-      if (done) return;
       if (current2 === sessionId) {
         abandonCandidate = false;
         return;
       }
-      if (current2 === void 0 && !reopenedOnce && tempPending !== null && !userRequestedClear) {
-        reopenedOnce = true;
-        abandonCandidate = false;
-        console.info("[temp-cwd] reopening temp session after watcher stole selection");
-        try {
-          sessions.open(sessionId);
-        } catch (err) {
-          console.warn("[temp-cwd] reopen failed:", err);
-        }
-        return;
-      }
       finalizeAbandon();
-    }, 2e3);
+    }, 1200);
   });
 }
 function TempCwdHost(props) {
@@ -338,17 +345,25 @@ function TempCwdHost(props) {
   }, [wsItems, sessionById, currentSessionId, onResumeArmCleanup]);
   React.useEffect(() => {
     if (tempPending !== null) return;
-    for (const w of wsItems) {
-      if (!isTempTitle(w.title)) continue;
+    const candidates = wsItems.filter((w) => {
+      if (!isTempTitle(w.title)) return false;
       const sessionsInside = Array.isArray(w.sessionIds) ? w.sessionIds : [];
       if (currentSessionId !== void 0 && sessionsInside.includes(currentSessionId)) {
-        continue;
+        return false;
       }
-      if (sweptOrphans.has(w.workspaceId)) continue;
-      sweptOrphans.add(w.workspaceId);
-      console.info("[temp-cwd] purging stale temp workspace on load", w.workspaceId);
-      void onPurgeStale(w);
-    }
+      return !sweptOrphans.has(w.workspaceId);
+    });
+    if (candidates.length === 0) return;
+    void (async () => {
+      for (const w of candidates) {
+        const info = await hostMarkerInfo(w.path);
+        const stale = info.hasMarker && Date.now() - info.mtimeMs >= PURGE_AGE_MS;
+        if (!stale) continue;
+        sweptOrphans.add(w.workspaceId);
+        console.info("[temp-cwd] purging stale temp workspace on load (marker age ok)", w.workspaceId);
+        await onPurgeStale(w);
+      }
+    })();
   }, [wsItems]);
   React.useEffect(() => {
     const id = window.setInterval(() => {

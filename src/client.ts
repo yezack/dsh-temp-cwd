@@ -263,6 +263,26 @@ async function hostRemoveMarker(path: string): Promise<void> {
 }
 
 /**
+ * Read the temp marker's age from the host. A fresh marker means another
+ * window may still be using this temp workspace — sweep/purge must only ever
+ * touch markers older than {@link PURGE_AGE_MS}.
+ */
+async function hostMarkerInfo(path: string): Promise<{ hasMarker: boolean; mtimeMs: number }> {
+  try {
+    const res = await fetch(`/api/temp-cwd/info?p=${encodeURIComponent(path)}`, {
+      method: 'POST',
+    })
+    if (!res.ok) return { hasMarker: false, mtimeMs: 0 }
+    return (await res.json()) as { hasMarker: boolean; mtimeMs: number }
+  } catch {
+    return { hasMarker: false, mtimeMs: 0 }
+  }
+}
+
+/** Markers younger than this are treated as possibly-live (other window). */
+const PURGE_AGE_MS = 20_000
+
+/**
  * Fully purge one stale temp workspace (leftover from an interrupted run):
  * archive every session it still holds (the host's "remove from the active
  * list" operation — otherwise the session would fall into 未分组 and show),
@@ -299,15 +319,24 @@ async function purgeStaleBeforeCreate(sessions: any, workspaces: any): Promise<v
   const sesSnap = sessions.list.getSnapshot()
   const items = Array.isArray(wsSnap?.items) ? wsSnap.items : []
   const current = sesSnap?.current
-  const stale = items.filter(
+  const candidates = items.filter(
     (w: any) =>
       isTempTitle(w.title) &&
       !(current !== undefined && Array.isArray(w.sessionIds) && w.sessionIds.includes(current)),
   )
-  if (stale.length === 0) return
-  console.info('[temp-cwd] purging stale temp workspace(s) before create:', stale.length)
-  for (const w of stale) {
+  if (candidates.length === 0) return
+  console.info(
+    '[temp-cwd] checking stale temp workspace(s) before create:',
+    candidates.length,
+  )
+  for (const w of candidates) {
+    // Age gate: never purge a marker younger than PURGE_AGE_MS — another
+    // window may be actively using this temp workspace right now.
+    const info = await hostMarkerInfo(w.path)
+    const stale = info.hasMarker && Date.now() - info.mtimeMs >= PURGE_AGE_MS
+    if (!stale) continue
     sweptOrphans.add(w.workspaceId)
+    console.info('[temp-cwd] purging stale temp workspace (marker age ok)', w.workspaceId)
     await purgeTempWorkspace(workspaces, w)
   }
 }
@@ -330,7 +359,6 @@ function armCleanup(
   let done = false
   let abandonCandidate = false
   let abandonTimer = 0
-  let reopenedOnce = false
 
   const finalizeAbandon = () => {
     if (done) return
@@ -395,13 +423,10 @@ function armCleanup(
       return
     }
 
-    // Abandon candidate: the current session moved away. Host-side
-    // "restore recent workspace" logic can steal the selection a few hundred
-    // ms after we open the temp session, so don't finalize immediately —
-    // wait out a grace window, and if we were only left in the no-session
-    // hero state, reopen our temp session once. Exception: when the user
-    // explicitly clicked a new-session button (our own clear ran), that is a
-    // real abandon — finalize right away and never reopen.
+    // Abandon candidate: the current session moved away. Give transient
+    // host-side selection churn (e.g. the startup "restore recent workspace"
+    // watcher) one short re-check — but NEVER auto-reopen the session. An
+    // explicit user "new session" click (our own clear) finalizes instantly.
     const abandoned = snap?.current !== sessionId
     if (!abandoned) {
       abandonCandidate = false
@@ -416,36 +441,16 @@ function armCleanup(
     if (abandonCandidate) return
     abandonCandidate = true
     abandonTimer = window.setTimeout(() => {
+      if (done) return
       const snap2 = sessions.list.getSnapshot()
       const current2 = snap2?.current
-      if (done) return
       if (current2 === sessionId) {
         // Selection came back — still active.
         abandonCandidate = false
         return
       }
-      if (
-        current2 === undefined &&
-        !reopenedOnce &&
-        tempPending !== null &&
-        !userRequestedClear
-      ) {
-        // Nobody is selected (hero): the host watcher dropped our selection
-        // without choosing another session — reopen the temp session once.
-        // NOTE: sessions.open(id) is SYNCHRONOUS (returns void), not a
-        // promise — calling .catch() on it would throw.
-        reopenedOnce = true
-        abandonCandidate = false
-        console.info('[temp-cwd] reopening temp session after watcher stole selection')
-        try {
-          sessions.open(sessionId)
-        } catch (err) {
-          console.warn('[temp-cwd] reopen failed:', err)
-        }
-        return
-      }
       finalizeAbandon()
-    }, 2000)
+    }, 1200)
   })
 }
 
@@ -557,26 +562,34 @@ function TempCwdHost(props: {
   }, [wsItems, sessionById, currentSessionId, onResumeArmCleanup])
 
   // Purge: temp workspaces left behind by interrupted runs (anything not
-  // currently open) are fully removed on the next load — sessions archived,
-  // folder removed, workspace deleted. Never purge while a temp workspace is
-  // being created and never touch the current session's workspace; remember
-  // purged ids so store churn cannot double-fire.
+  // currently open) are removed on the next load — but ONLY once their marker
+  // is older than PURGE_AGE_MS, so a fresh temp workspace still in use by
+  // another window is never touched. Remember checked ids so store churn
+  // cannot double-fire.
   React.useEffect(() => {
     if (tempPending !== null) return
-    for (const w of wsItems) {
-      if (!isTempTitle(w.title)) continue
+    const candidates = wsItems.filter((w: any) => {
+      if (!isTempTitle(w.title)) return false
       const sessionsInside = Array.isArray(w.sessionIds) ? w.sessionIds : []
       if (
         currentSessionId !== undefined &&
         sessionsInside.includes(currentSessionId)
       ) {
-        continue
+        return false
       }
-      if (sweptOrphans.has(w.workspaceId)) continue
-      sweptOrphans.add(w.workspaceId)
-      console.info('[temp-cwd] purging stale temp workspace on load', w.workspaceId)
-      void onPurgeStale(w)
-    }
+      return !sweptOrphans.has(w.workspaceId)
+    })
+    if (candidates.length === 0) return
+    void (async () => {
+      for (const w of candidates) {
+        const info = await hostMarkerInfo(w.path)
+        const stale = info.hasMarker && Date.now() - info.mtimeMs >= PURGE_AGE_MS
+        if (!stale) continue
+        sweptOrphans.add(w.workspaceId)
+        console.info('[temp-cwd] purging stale temp workspace on load (marker age ok)', w.workspaceId)
+        await onPurgeStale(w)
+      }
+    })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wsItems])
 
