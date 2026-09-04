@@ -461,7 +461,18 @@ function TempCwdHost(props: {
 
 /* ---- transient temp-session UI (frozen chip + hidden sidebar rows) ---- */
 
-/** The temp workspace's sidebar rows: its projectRow + following sessionRows. */
+/**
+ * The temp workspace's sidebar rows, returned as the actual hide units.
+ *
+ * DOM shape (observed): each visible row is a `div[role=treeitem]` wrapped in
+ * a SPAN (`_root_…`), and one group section (`.groupSection`) contains the
+ * wrapper of the workspace row followed by the wrappers of its session rows.
+ * Hiding the bare row div is not enough — the wrapper span stays and the
+ * session rows (e.g. the SELECTED blank `…sessionRow …selected` 「新会话」)
+ * remain visible next to it. So this returns the WRAPPERS: the temp
+ * workspace row's wrapper plus every following wrapper in the same section
+ * that contains a session row (stop at the next workspace row wrapper).
+ */
 function tempRowRegion(): HTMLElement[] {
   const rows = Array.from(
     document.querySelectorAll('div[role="treeitem"][class*="projectRow"]'),
@@ -471,16 +482,30 @@ function tempRowRegion(): HTMLElement[] {
     const title = row.querySelector('span[class*="projectText"]')
     const text = title?.textContent ?? ''
     if (!isTempTitle(text.trim())) continue
+
     const el = row as HTMLElement
-    out.push(el)
-    const parent = el.parentElement
-    if (parent === null) continue
-    const kids = Array.from(parent.children)
-    const index = kids.indexOf(el)
+    const wrapper = el.parentElement as HTMLElement | null
+    if (wrapper === null) {
+      // No wrapper (unexpected layout) — hide the row itself as a fallback.
+      out.push(el)
+      continue
+    }
+    out.push(wrapper)
+    const container = wrapper.parentElement
+    if (container === null) continue
+    const kids = Array.from(container.children)
+    const index = kids.indexOf(wrapper)
     for (let i = index + 1; i < kids.length; i += 1) {
       const sibling = kids[i] as HTMLElement
-      if (sibling.matches('div[role="treeitem"][class*="projectRow"]')) break
-      if (sibling.matches('div[role="treeitem"][class*="sessionRow"]')) out.push(sibling)
+      const inside = sibling.querySelector(
+        'div[role="treeitem"][class*="projectRow"]',
+      )
+      if (inside !== null) break
+      if (
+        sibling.querySelector('div[role="treeitem"][class*="sessionRow"]') !== null
+      ) {
+        out.push(sibling)
+      }
     }
   }
   return out
@@ -501,16 +526,9 @@ function syncTransientUI(active: boolean): void {
   const region = tempRowRegion()
 
   if (!active) {
-    // Un-hide the temp region rows (and any stragglers still tagged).
-    for (const el of region) {
-      delete el.style.display
-      delete el.dataset.tempcwdHidden
-    }
-    for (const el of document.querySelectorAll('[data-tempcwd-hidden]')) {
-      const node = el as HTMLElement
-      delete node.style.display
-      delete node.dataset.tempcwdHidden
-    }
+    // Chip freeze is transient-only: restore it once the blank temp session
+    // ends. Temp workspace ROWS are hidden unconditionally (any temp-titled
+    // workspace row must never surface in the list, not even stale ones).
     for (const el of document.querySelectorAll('[data-tempcwd-freeze]')) {
       const chip = el as HTMLElement
       delete chip.style.pointerEvents
@@ -520,27 +538,28 @@ function syncTransientUI(active: boolean): void {
       }
       delete chip.dataset.tempcwdFreeze
     }
-    return
-  }
-
-  // Freeze the official hero workspace chip (first <button> in the hero row;
-  // the pill is not mounted while bound, so that IS the workspace chip).
-  const hero = findHeroRow()
-  const chip = hero === null ? null : hero.querySelector('button')
-  if (chip !== null && !(chip as HTMLElement).dataset.tempcwdFreeze) {
-    const el = chip as HTMLElement
-    el.dataset.tempcwdFreeze = '1'
-    el.style.pointerEvents = 'none'
-    const guard = (event: Event) => {
-      // Keep the official picker closed while the temp session is blank.
-      event.preventDefault()
-      event.stopPropagation()
+  } else {
+    // Freeze the official hero workspace chip (first <button> in the hero
+    // row; the pill is not mounted while bound, so that IS the workspace
+    // chip).
+    const hero = findHeroRow()
+    const chip = hero === null ? null : hero.querySelector('button')
+    if (chip !== null && !(chip as HTMLElement).dataset.tempcwdFreeze) {
+      const el = chip as HTMLElement
+      el.dataset.tempcwdFreeze = '1'
+      el.style.pointerEvents = 'none'
+      const guard = (event: Event) => {
+        // Keep the official picker closed while the temp session is blank.
+        event.preventDefault()
+        event.stopPropagation()
+      }
+      el.__tempCwdGuard = guard
+      el.addEventListener('click', guard, true)
     }
-    el.__tempCwdGuard = guard
-    el.addEventListener('click', guard, true)
   }
 
-  // Hide every temp workspace row + its blank child sessions.
+  // Hide every temp workspace row + its blank child sessions. Runs on every
+  // tick regardless of `active` so stale temp rows never resurface either.
   for (const el of region) {
     el.dataset.tempcwdHidden = '1'
     el.style.display = 'none'

@@ -293,15 +293,25 @@ function tempRowRegion() {
     const text = title?.textContent ?? "";
     if (!isTempTitle(text.trim())) continue;
     const el = row;
-    out.push(el);
-    const parent = el.parentElement;
-    if (parent === null) continue;
-    const kids = Array.from(parent.children);
-    const index = kids.indexOf(el);
+    const wrapper = el.parentElement;
+    if (wrapper === null) {
+      out.push(el);
+      continue;
+    }
+    out.push(wrapper);
+    const container = wrapper.parentElement;
+    if (container === null) continue;
+    const kids = Array.from(container.children);
+    const index = kids.indexOf(wrapper);
     for (let i = index + 1; i < kids.length; i += 1) {
       const sibling = kids[i];
-      if (sibling.matches('div[role="treeitem"][class*="projectRow"]')) break;
-      if (sibling.matches('div[role="treeitem"][class*="sessionRow"]')) out.push(sibling);
+      const inside = sibling.querySelector(
+        'div[role="treeitem"][class*="projectRow"]'
+      );
+      if (inside !== null) break;
+      if (sibling.querySelector('div[role="treeitem"][class*="sessionRow"]') !== null) {
+        out.push(sibling);
+      }
     }
   }
   return out;
@@ -309,38 +319,29 @@ function tempRowRegion() {
 function syncTransientUI(active) {
   const region = tempRowRegion();
   if (!active) {
-    for (const el of region) {
-      delete el.style.display;
-      delete el.dataset.tempcwdHidden;
-    }
-    for (const el of document.querySelectorAll("[data-tempcwd-hidden]")) {
-      const node = el;
-      delete node.style.display;
-      delete node.dataset.tempcwdHidden;
-    }
     for (const el of document.querySelectorAll("[data-tempcwd-freeze]")) {
-      const chip2 = el;
-      delete chip2.style.pointerEvents;
-      if (chip2.__tempCwdGuard !== void 0) {
-        chip2.removeEventListener("click", chip2.__tempCwdGuard, true);
-        chip2.__tempCwdGuard = void 0;
+      const chip = el;
+      delete chip.style.pointerEvents;
+      if (chip.__tempCwdGuard !== void 0) {
+        chip.removeEventListener("click", chip.__tempCwdGuard, true);
+        chip.__tempCwdGuard = void 0;
       }
-      delete chip2.dataset.tempcwdFreeze;
+      delete chip.dataset.tempcwdFreeze;
     }
-    return;
-  }
-  const hero = findHeroRow();
-  const chip = hero === null ? null : hero.querySelector("button");
-  if (chip !== null && !chip.dataset.tempcwdFreeze) {
-    const el = chip;
-    el.dataset.tempcwdFreeze = "1";
-    el.style.pointerEvents = "none";
-    const guard = (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-    };
-    el.__tempCwdGuard = guard;
-    el.addEventListener("click", guard, true);
+  } else {
+    const hero = findHeroRow();
+    const chip = hero === null ? null : hero.querySelector("button");
+    if (chip !== null && !chip.dataset.tempcwdFreeze) {
+      const el = chip;
+      el.dataset.tempcwdFreeze = "1";
+      el.style.pointerEvents = "none";
+      const guard = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      };
+      el.__tempCwdGuard = guard;
+      el.addEventListener("click", guard, true);
+    }
   }
   for (const el of region) {
     el.dataset.tempcwdHidden = "1";
