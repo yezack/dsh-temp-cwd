@@ -6,6 +6,10 @@ import z from "schemastery";
 var name = "temp-cwd";
 var inject = ["webServer", "workspaceRegistry"];
 var MARKER_FILE = ".TEMP_WORKSPACE";
+var SETTINGS_NS = "@yezack/dsh-temp-cwd/settings";
+var SettingsSchema = z.object({
+  rootDirectory: z.string().default("")
+});
 var ABANDON_DEBOUNCE_MS = 2e3;
 var SWEEP_AGE_MS = 6e4;
 var SWEEP_INTERVAL_MS = 3e4;
@@ -62,8 +66,30 @@ function dropMarker(dir) {
   }
 }
 function apply(ctx, config) {
-  const root = resolve(config.rootDirectory);
+  let root = resolve(config.rootDirectory);
   const registry = ctx.workspaceRegistry;
+  try {
+    ctx.inject(["settings"], (settingsCtx) => {
+      const scope = settingsCtx.settings.register(SETTINGS_NS, SettingsSchema, {
+        base: { rootDirectory: "" }
+      });
+      const applyOverride = () => {
+        const value = scope.getSnapshot?.().value ?? scope.getSnapshot?.();
+        const dir = value?.rootDirectory;
+        if (typeof dir === "string" && dir.trim().length > 0) {
+          root = resolve(dir.trim());
+          console.info("[temp-cwd] [host] temp root directory =", root);
+        } else if (value !== void 0) {
+          root = resolve(config.rootDirectory);
+        }
+      };
+      applyOverride();
+      if (typeof scope.on === "function") scope.on("update", applyOverride);
+      else if (typeof scope.subscribe === "function") scope.subscribe(applyOverride);
+    });
+  } catch (err) {
+    console.warn("[temp-cwd] [host] settings scope unavailable, using Config default:", err);
+  }
   const ledger = /* @__PURE__ */ new Map();
   const finalizeNow = (dir, entry) => {
     if (entry?.abandonTimer !== null && entry?.abandonTimer !== void 0) {
@@ -253,6 +279,8 @@ function apply(ctx, config) {
 export {
   Config,
   MARKER_FILE,
+  SETTINGS_NS,
+  SettingsSchema,
   apply,
   inject,
   name

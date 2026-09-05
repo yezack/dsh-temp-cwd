@@ -107,6 +107,8 @@ export function apply(ctx: any): void {
   ensurePillStyle()
   ensureBatchStyle()
   ensureBatchOverlayStyle()
+  ensureSettingsStyle()
+  registerSettingsCard(ctx)
   startUngroupedUi()
 
   // Headless host on the official sidebar.footer.action LIST seat (renders
@@ -977,6 +979,238 @@ function closeBatchPanel(): void {
     batchPanel = null
   }
   for (const el of document.querySelectorAll('.tcwd-scrim, .tcwd-confirm')) el.remove()
+}
+
+/* ---- settings card: temp conversation save location (dsh-rewind style) ---- */
+const SETTINGS_NS = '@yezack/dsh-temp-cwd/settings'
+const SETTINGS_CSS_ID = '@yezack/dsh-temp-cwd/settings.css'
+
+function ensureSettingsStyle(): void {
+  if (typeof document === 'undefined') return
+  if (document.querySelector(`style[data-plugin-css="${SETTINGS_CSS_ID}"]`) !== null) return
+  const tag = document.createElement('style')
+  tag.dataset.pluginCss = SETTINGS_CSS_ID
+  tag.textContent = [
+    '.dsh-temp-settings-card{list-style:none;margin:0}',
+    '.dsh-temp-settings-header{box-sizing:border-box;display:flex;align-items:center;gap:10px;width:100%;color:var(--dsw-alias-label-primary);background:none;border:none;padding:6px 2px;cursor:pointer;text-align:left;font:inherit}',
+    '.dsh-temp-settings-head-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}',
+    '.dsh-temp-settings-name{font-size:14px;font-weight:600;line-height:20px}',
+    '.dsh-temp-settings-desc{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}',
+    '.dsh-temp-settings-chevron{flex:none;transition:transform .15s var(--ds-ease-in-out,ease)}',
+    '.dsh-temp-settings-chevron-open{transform:rotate(180deg)}',
+    '.dsh-temp-settings-body{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:10px;margin-bottom:8px}',
+    '.dsh-temp-settings-label{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}',
+    '.dsh-temp-settings-row{display:flex;align-items:center;gap:8px}',
+    '.dsh-temp-settings-input{flex:1;min-width:0;box-sizing:border-box;height:30px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-primary);padding:0 10px;font:inherit;font-size:13px;outline:none}',
+    '.dsh-temp-settings-input:focus{border-color:var(--dsw-alias-state-business-primary)}',
+    '.dsh-temp-settings-btn{border:1px solid var(--dsw-alias-border-l2);background:none;color:var(--dsw-alias-label-secondary);border-radius:999px;padding:2px 12px;font:inherit;font-size:13px;cursor:pointer;flex:none}',
+    '.dsh-temp-settings-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+    '.dsh-temp-settings-btn:disabled{opacity:.5;cursor:default}',
+    '.dsh-temp-settings-primary{background:var(--dsw-alias-button-ghost-active-fill,var(--dsw-alias-interactive-bg-hover));border-color:transparent;color:var(--dsw-alias-label-primary)}',
+    '.dsh-temp-settings-hint{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}',
+    '.dsh-temp-settings-error{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}',
+  ].join('\n')
+  document.head.appendChild(tag)
+}
+
+/** React card rendered by the settings.plugin.item seat (no JSX). */
+function SettingsRootCard(props: { api: any }): any {
+  const { api } = props
+  const [open, setOpen] = React.useState(false)
+  const [draft, setDraft] = React.useState(() => api.read())
+  const [baseline, setBaseline] = React.useState(() => api.read())
+  const [busy, setBusy] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
+
+  React.useEffect(() => {
+    const dispose = api.subscribe(() => {
+      const next = api.read()
+      setBaseline(next)
+      setDraft(next)
+      setError(null)
+    })
+    return dispose
+  }, [api])
+
+  const dirty = draft.rootDirectory !== baseline.rootDirectory
+  const writable = api.writable()
+
+  const save = async () => {
+    if (busy || !writable || !dirty) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api.save({ rootDirectory: draft.rootDirectory.trim() })
+      setBaseline({ rootDirectory: draft.rootDirectory.trim() })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const pickDirectory = async () => {
+    setError(null)
+    try {
+      const picker = api.picker
+      if (picker === null) {
+        setError('当前环境没有可用的目录选择器，请手动输入路径')
+        return
+      }
+      const result = await picker.pick()
+      const value = result?.value ?? result ?? {}
+      const path =
+        typeof value.path === 'string' ? value.path : typeof value.directoryPath === 'string' ? value.directoryPath : typeof result === 'string' ? result : ''
+      if (path.length > 0) setDraft({ rootDirectory: path })
+      else setError('未获得目录路径')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const body = open
+    ? React.createElement(
+        'div',
+        { className: 'dsh-temp-settings-body' },
+        React.createElement('div', { className: 'dsh-temp-settings-label' }, '临时对话保存位置（目录）'),
+        React.createElement(
+          'div',
+          { className: 'dsh-temp-settings-row' },
+          React.createElement('input', {
+            className: 'dsh-temp-settings-input',
+            type: 'text',
+            value: draft.rootDirectory,
+            placeholder: '默认 ~/Documents/dsh-workspaces',
+            disabled: busy || !writable,
+            spellCheck: false,
+            onChange: (event: any) => {
+              setDraft({ rootDirectory: event.target.value })
+              setError(null)
+            },
+          }),
+          React.createElement(
+            'button',
+            { type: 'button', className: 'dsh-temp-settings-btn', onClick: () => void pickDirectory(), disabled: busy || !writable },
+            '选择…',
+          ),
+        ),
+        React.createElement(
+          'div',
+          { className: 'dsh-temp-settings-hint' },
+          '留空使用默认位置；新临时对话将从保存位置读取。保存后需重启应用完全生效。',
+        ),
+        error !== null ? React.createElement('div', { className: 'dsh-temp-settings-error' }, error) : null,
+        React.createElement(
+          'div',
+          { className: 'dsh-temp-settings-row', style: { justifyContent: 'flex-end' } },
+          React.createElement(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-temp-settings-btn dsh-temp-settings-primary',
+              onClick: () => void save(),
+              disabled: busy || !writable || !dirty,
+            },
+            busy ? '保存中…' : '保存',
+          ),
+          React.createElement(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-temp-settings-btn',
+              onClick: () => {
+                setDraft(baseline)
+                setError(null)
+              },
+              disabled: busy || !dirty,
+            },
+            '放弃修改',
+          ),
+        ),
+      )
+    : null
+
+  return React.createElement(
+    'li',
+    { className: 'dsh-temp-settings-card' },
+    React.createElement(
+      'button',
+      {
+        type: 'button',
+        className: 'dsh-temp-settings-header',
+        'aria-expanded': open,
+        onClick: () => setOpen(!open),
+      },
+      React.createElement(
+        'span',
+        { className: 'dsh-temp-settings-head-text' },
+        React.createElement('span', { className: 'dsh-temp-settings-name' }, '临时对话保存位置'),
+        React.createElement('span', { className: 'dsh-temp-settings-desc' }, draft.rootDirectory || '默认 ~/Documents/dsh-workspaces'),
+      ),
+      React.createElement(
+        'svg',
+        { className: `dsh-temp-settings-chevron${open ? ' dsh-temp-settings-chevron-open' : ''}`, width: 14, height: 14, viewBox: '0 0 16 16', 'aria-hidden': 'true' },
+        React.createElement('path', { d: 'M4 6l4 4 4-4', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' }),
+      ),
+    ),
+    body,
+  )
+}
+
+/**
+ * Register the settings card (mirrors dsh-rewind's cleanup card): bind the
+ * plugin settings namespace through `settingsScope`, then contribute a keyed
+ * card on `settings.plugin.item`.
+ */
+function registerSettingsCard(ctx: any): void {
+  try {
+    const clientCtx = ctx
+    const inject = typeof clientCtx.inject === 'function' ? clientCtx.inject.bind(clientCtx) : null
+    if (inject === null) return
+    inject(['settingsScope'], (scoped: any) => {
+      try {
+        const scope = scoped.settingsScope.bind({ namespace: SETTINGS_NS })
+        const read = () => {
+          const snapshot = scope.getSnapshot()
+          const value = snapshot?.value ?? {}
+          return {
+            rootDirectory:
+              typeof value.rootDirectory === 'string' ? value.rootDirectory : '',
+          }
+        }
+        let pickerApi: any = null
+        try {
+          const picker = clientCtx.get?.('directoryPicker')
+          if (picker !== void 0 && typeof picker.pick === 'function') pickerApi = picker
+        } catch {
+          pickerApi = null
+        }
+        const api = {
+          read,
+          writable: () => scope.getSnapshot()?.writable === true,
+          save: async (next: { rootDirectory: string }) => {
+            await scope.set('rootDirectory', next.rootDirectory)
+          },
+          subscribe: (cb: () => void) => scope.subscribe(cb),
+          picker: pickerApi,
+        }
+        scoped.slots.inject('settings.plugin.item', () =>
+          scoped.slots.register(
+            {
+              name: 'settings.plugin.item',
+              key: SETTINGS_NS,
+              inject: () => ({ api }),
+            },
+            SettingsRootCard,
+          ),
+        )
+      } catch (err) {
+        console.warn('[temp-cwd] settings card register failed:', err)
+      }
+    })
+  } catch (err) {
+    console.warn('[temp-cwd] settingsScope unavailable:', err)
+  }
 }
 
 /* ---- helpers ---- */

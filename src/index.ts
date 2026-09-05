@@ -42,6 +42,14 @@ export const inject = ['webServer', 'workspaceRegistry']
 /** Marker file: presence authorizes whole-folder deletion on abandon. */
 export const MARKER_FILE = '.TEMP_WORKSPACE'
 
+/** Settings namespace for the plugin configuration card (shared with client). */
+export const SETTINGS_NS = '@yezack/dsh-temp-cwd/settings'
+
+/** Settings schema: an empty rootDirectory means "use the Config default". */
+export const SettingsSchema = z.object({
+  rootDirectory: z.string().default(''),
+})
+
 /** Abandon is debounced this long (ms) — duplicate calls coalesce. */
 const ABANDON_DEBOUNCE_MS = 2000
 
@@ -142,8 +150,36 @@ interface LedgerEntry {
  * @param config - resolved plugin config.
  */
 export function apply(ctx: any, config: any): void {
-  const root = resolve(config.rootDirectory)
+  // Root directory: Config default first, then live-overridable from the
+  // plugin settings card (saved via the settings namespace below). Routes and
+  // the sweep timer read the current value through this `let`.
+  let root = resolve(config.rootDirectory)
   const registry = ctx.workspaceRegistry
+
+  // Settings-backed override: when the user saves a rootDirectory in the
+  // plugin settings page it replaces the default from the next request on.
+  try {
+    ctx.inject(['settings'], (settingsCtx: any) => {
+      const scope = settingsCtx.settings.register(SETTINGS_NS, SettingsSchema, {
+        base: { rootDirectory: '' },
+      })
+      const applyOverride = () => {
+        const value = scope.getSnapshot?.().value ?? scope.getSnapshot?.()
+        const dir = value?.rootDirectory
+        if (typeof dir === 'string' && dir.trim().length > 0) {
+          root = resolve(dir.trim())
+          console.info('[temp-cwd] [host] temp root directory =', root)
+        } else if (value !== void 0) {
+          root = resolve(config.rootDirectory)
+        }
+      }
+      applyOverride()
+      if (typeof scope.on === 'function') scope.on('update', applyOverride)
+      else if (typeof scope.subscribe === 'function') scope.subscribe(applyOverride)
+    })
+  } catch (err) {
+    console.warn('[temp-cwd] [host] settings scope unavailable, using Config default:', err)
+  }
 
   /** path → ledger entry (the single host-side source of truth). */
   const ledger = new Map<string, LedgerEntry>()
